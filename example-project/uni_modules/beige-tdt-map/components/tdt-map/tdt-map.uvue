@@ -123,10 +123,14 @@ import {
   setStyle as nativeSetStyle,
   removeStyle as nativeRemoveStyle,
   addWMSTileLayer as nativeAddWMSTileLayer,
-  isSupportCanvas as nativeIsSupportCanvas
+  isSupportCanvas as nativeIsSupportCanvas,
+  // v1.9.0: 图片覆盖物（重命名导入避免与下方同名 setup 函数冲突）
+  addImageOverlay as nativeAddImageOverlay,
+  updateImageOverlay as nativeUpdateImageOverlay,
+  setImageOverlayClickCallback as nativeSetImageOverlayClickCallback
 } from '@/uni_modules/beige-tdt-map'
 import globalConfig from '@/uni_modules/beige-tdt-map/config'
-import type { MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions } from '@/uni_modules/beige-tdt-map'
+import type { MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickDetail } from '@/uni_modules/beige-tdt-map'
 
 const props = defineProps({
   apiKey: { type: String, default: '' },
@@ -170,6 +174,8 @@ const emit = defineEmits<{
   (e: 'cameraChange', detail: MapClickDetail): void
   // v1.5.0: 搜索完成事件，返回结果列表
   (e: 'searchResult', results: Array<SearchResultItem>): void
+  // v1.9.0: 图片覆盖物点击（detail.id 为 addImageOverlay 返回的 overlay ID）
+  (e: 'imageOverlayClick', detail: ImageOverlayClickDetail): void
 }>()
 
 const isMapReady = ref(false)
@@ -370,6 +376,11 @@ function onNativeViewInit(e: UniNativeViewInitEvent): void {
     // v1.6.0: 相机变化后重算比例尺
     updateScale()
     emit('cameraChange', detail)
+  })
+
+  // v1.9.0: 注册图片覆盖物点击回调
+  nativeSetImageOverlayClickCallback((detail: ImageOverlayClickDetail) => {
+    emit('imageOverlayClick', detail)
   })
 }
 
@@ -589,6 +600,10 @@ function setStyle(styleJson: string): void { nativeSetStyle(styleJson) }
 function removeStyle(): void { nativeRemoveStyle() }
 function isSupportCanvas(): boolean { return nativeIsSupportCanvas() }
 
+// ── v1.9.0 新增：图片覆盖物（移除/显隐复用 removeOverlayById/showOverlayById/hideOverlayById）──
+function addImageOverlay(params: ImageOverlayOptions): number { return nativeAddImageOverlay(params) }
+function updateImageOverlay(id: number, changes: ImageOverlayUpdateOptions): void { nativeUpdateImageOverlay(id, changes) }
+
 // ── v1.4.0 新增：地图交互增强 ──
 function setMapBearing(bearing: number): void { setBearing(bearing) }
 function setMapTilt(tilt: number): void { setTilt(tilt) }
@@ -647,6 +662,11 @@ onMounted(() => {
     updateScale()
     emit('cameraChange', detail)
   })
+
+  // v1.9.0: 注册图片覆盖物点击回调（Web 平台初始化路径）
+  nativeSetImageOverlayClickCallback((detail: ImageOverlayClickDetail) => {
+    emit('imageOverlayClick', detail)
+  })
 })
 // #endif
 
@@ -686,6 +706,7 @@ defineExpose({
   setShowUserLocation, getCurrentLocation, showMarkerInfoById, hideMarkerInfoById,
   addTileLayer, removeTileLayer,
   addWMSTileLayer, setStyle, removeStyle, isSupportCanvas,
+  addImageOverlay, updateImageOverlay,
   setMapBearing, setMapTilt, getMapBearing, getMapTilt, setRotateEnabled, setTiltEnabled,
   addMarkerCluster, removeMarkerCluster, addHeatmap, removeHeatmap,
   isMapReady,
