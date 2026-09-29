@@ -176,6 +176,7 @@
         <view class="btn-row">
           <button class="btn" @tap="demoAddGeoPolygon">基本多边形</button>
           <button class="btn" @tap="demoAddGeoMultiHole">多面带洞</button>
+          <button class="btn" @tap="demoAddGeoDashLine">邻省虚线</button>
           <button class="btn" @tap="demoHideGeoLayer">隐藏整层</button>
           <button class="btn" @tap="demoShowGeoLayer">显示整层</button>
           <button class="btn btn-danger" @tap="demoRemoveGeoLayer">移除整层</button>
@@ -778,6 +779,23 @@ function demoAddGeoMultiHole(): void {
   const id = mapRef.value?.addGeoJsonLayer(GEOJSON_FIXTURE_MULTI_HOLE, opts) ?? 0
   lastGeoLayerId = id
   infoText.value = id > 0 ? 'GeoJSON 层 #' + id + ' 已加载（多面带洞 + 属性缺失兜底用例）' : 'GeoJSON 层加载失败'
+}
+
+// 邻省虚线用例（E0.3a）：LineString 灰色虚线 [4,4] 宽 0.8 无填充，对齐 chatbot 邻省界样式；
+// 鸿蒙端 MapKit 无虚线参数自动降级实线（console 警告）
+const GEOJSON_FIXTURE_DASH_LINE: string = '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"邻省界示例"},"geometry":{"type":"LineString","coordinates":[[116.34,39.86],[116.38,39.87],[116.42,39.855],[116.47,39.865]]}}]}'
+
+function demoAddGeoDashLine(): void {
+  const opts: GeoJsonLayerOptions = {
+    lineColor: '#aaaaaa',
+    lineWidth: 1,
+    lineDash: [4, 4],
+    fillColor: null,
+    label: null
+  }
+  const id = mapRef.value?.addGeoJsonLayer(GEOJSON_FIXTURE_DASH_LINE, opts) ?? 0
+  lastGeoLayerId = id
+  infoText.value = id > 0 ? 'GeoJSON 层 #' + id + ' 已加载（灰虚线 [4,4]，lineWidth=1）' : 'GeoJSON 层加载失败'
 }
 
 function demoHideGeoLayer(): void {

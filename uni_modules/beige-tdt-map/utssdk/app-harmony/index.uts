@@ -631,6 +631,61 @@ export function addPolyline(points: Array<MapClickDetail>, color: string, width:
     return id
 }
 
+// ══════════════════════════════════════════════
+// v1.9.0 新增：E0.3a styled 折线
+// ══════════════════════════════════════════════
+// 华为 MapKit MapPolylineOptions 无 dash 数组参数（与 legacy addPolyline 同为实线），
+// 按任务约定降级：忽略 dash 并 console 警告（模块级 flag 仅提示一次防刷屏）；
+// opacity 并入颜色 alpha 通道（MapKit 无独立透明度参数）。
+// 遗留验证项：若后续 DevEco SDK 验证 MapPolylineOptions 存在 dotted 字段，可低成本接入虚线
+let styledDashWarned: boolean = false
+
+// 颜色数值（ARGB）的 alpha 通道替换为 opacity（0~1）
+function applyOpacityToColor(colorNum: number, opacity: number): number {
+    if (opacity >= 1) return colorNum
+    if (opacity < 0) return (0 as number) * 16777216 + (colorNum % 16777216)
+    const alpha = Math.round(opacity * 255)
+    return alpha * 16777216 + (colorNum % 16777216)
+}
+
+export function addStyledPolyline(points: Array<MapClickDetail>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+    if (mapController == null || points.length < 2) return 0
+    if (dash != null && dash.length > 0 && !styledDashWarned) {
+        styledDashWarned = true
+        console.warn("TDTMap: 鸿蒙 MapKit 折线不支持虚线（MapPolylineOptions 无 dash 参数），已降级实线")
+    }
+    // 预分配 ID（同步）
+    overlayIdCounter++
+    const id = overlayIdCounter
+    overlayMap.set(id, { id: id, type: 'styledPolyline', nativeRef: null, isVisible: true })
+    const latLngs: Array<mapCommon.LatLng> = []
+    for (let i = 0; i < points.length; i++) {
+        latLngs.push({ latitude: points[i].lat, longitude: points[i].lng })
+    }
+    const colorNum = applyOpacityToColor(parseColorHex(color), opacity ?? 1)
+    mapController.addPolyline({
+        points: latLngs,
+        color: colorNum,
+        width: width,
+        visible: true
+    }).then((polyline: any) => {
+        if (polyline != null) {
+            polylines.push(polyline)
+            const entry = overlayMap.get(id)
+            if (entry != null) {
+                entry.nativeRef = polyline
+            }
+        }
+    }).catch((e: any) => {
+        console.error("TDTMap: 添加 styled 折线失败: " + (e.message ?? String(e)))
+        overlayMap.delete(id)
+        if (onErrorCallback != null) {
+            onErrorCallback({ code: 4, message: "添加 styled 折线失败: " + (e.message ?? String(e)) })
+        }
+    })
+    return id
+}
+
 // ==================== 覆盖物：圆（鸿蒙原生支持） ====================
 
 // context7 验证：addCircle 返回 Promise<MapCircle>，改用预分配 ID + .then() 同步返回 number
@@ -1129,7 +1184,8 @@ export function removeOverlay(id: number): void {
         markerList = markerList.filter(m => m !== ref)
     } else if (entry.type == 'polygon') {
         polygons = polygons.filter(p => p !== ref)
-    } else if (entry.type == 'polyline') {
+    } else if (entry.type == 'polyline' || entry.type == 'styledPolyline') {
+        // v1.9.0: styled 折线同样存于 polylines 数组（同为 MapPolyline 原生对象）
         polylines = polylines.filter(p => p !== ref)
     } else if (entry.type == 'circle') {
         circles = circles.filter(c => c !== ref)

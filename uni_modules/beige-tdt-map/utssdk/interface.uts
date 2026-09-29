@@ -318,3 +318,10 @@ export type GeoJsonLayerOptions = {
 // 组件层据此按快照重放已注册的 GeoJSON 层（防样式切换后图层静默丢失）；鸿蒙无样式重建不触发
 export type GeoJsonReplayCallback = () => void
 export declare function setGeoJsonReplayCallback(callback: GeoJsonReplayCallback | null): void
+
+// 添加 styled 折线（E0.3a）：dash=null 实线 / 如 [4,4] 虚线；opacity 0~1（缺省 1.0）。
+// 与 legacy addPolyline 并行的新原语（legacy Android 注记路径无虚线、Web 硬编码 line-opacity 0.8——均保持零变化）。
+// Android 走 LineLayer+GeoJsonSource；iOS 在 legacy source+layer 结构上加 lineDashpattern/lineOpacity；
+// Web 参数化 line-dasharray/line-opacity；鸿蒙 MapKit 折线无 dash 参数，忽略 dash 降级实线（console 警告），
+// opacity 并入颜色 alpha 通道。返回 overlay ID（0=失败），与 removeOverlay/showOverlay/hideOverlay 统一管理
+export declare function addStyledPolyline(points: Array<MapClickDetail>, color: string, width: number, dash: Array<number> | null, opacity?: number): number

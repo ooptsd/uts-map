@@ -579,6 +579,43 @@ export function addPolyline(points: Array<MapClickDetail>, color: string, width:
     }
 }
 
+// ══════════════════════════════════════════════
+// v1.9.0 新增：E0.3a styled 折线（虚线/透明度）
+// ══════════════════════════════════════════════
+// 沿用 legacy addPolyline 的 MLNShapeSource+MLNLineStyleLayer 结构，仅追加
+// lineDashpattern（ObjC 属性名小写 p）/ lineOpacity 两个 paint 属性，legacy 行为零变化；
+// 存入 polylines 数组（clearOverlays 批量移除复用既有遍历）
+export function addStyledPolyline(points: Array<MapClickDetail>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+    if (mapView == null || mapView.style == null || points.length < 2) return 0
+    const coordinates: Array<CLLocationCoordinate2D> = []
+    for (let i = 0; i < points.length; i++) {
+        coordinates.push(CLLocationCoordinate2DMake(points[i].lat, points[i].lng))
+    }
+    const lineId = "tdt-styled-line-" + polylines.length.toString()
+    try {
+        const polyline = MLNPolyline(coordinates, points.length)
+        const source = new MLNShapeSource(lineId, polyline, null)
+        mapView.style?.addSource(source)
+        const layer = new MLNLineStyleLayer(lineId + "-layer", source)
+        layer.lineColor = NSExpression(forConstantValue: parseColor(color))
+        layer.lineWidth = NSExpression(forConstantValue: width)
+        layer.lineOpacity = NSExpression(forConstantValue: opacity ?? 1.0)
+        if (dash != null && dash.length > 0) {
+            // UTS Array<number> 桥接 NSArray<NSNumber>，MLN lineDashpattern 接受 NSNumber 数组（style spec: 单位为线宽倍数）
+            layer.lineDashpattern = NSExpression(forConstantValue: dash)
+        }
+        mapView.style?.addLayer(layer)
+        const entry = { source: source, layer: layer }
+        polylines.push(entry)
+        return allocateOverlayId('styledPolyline', entry)
+    } catch (e) {
+        if (onErrorCallback != null) {
+            onErrorCallback({ code: 4, message: "添加 styled 折线失败: " + e.toString() })
+        }
+        return 0
+    }
+}
+
 // ==================== 覆盖物：圆（多边形近似，36 边） ====================
 
 const EARTH_RADIUS = 6378137.0
@@ -1029,7 +1066,8 @@ export function removeOverlay(id: number): void {
         // 同步清理类型数组
         if (entry.type == 'polygon') {
             polygons = polygons.filter(e => e !== ref)
-        } else if (entry.type == 'polyline') {
+        } else if (entry.type == 'polyline' || entry.type == 'styledPolyline') {
+            // v1.9.0: styled 折线同样存于 polylines 数组（clearOverlays 批量移除复用既有遍历）
             polylines = polylines.filter(e => e !== ref)
         } else if (entry.type == 'circle') {
             circles = circles.filter(e => e !== ref)

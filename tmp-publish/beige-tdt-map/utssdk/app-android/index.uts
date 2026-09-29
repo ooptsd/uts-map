@@ -8,7 +8,9 @@ import { Property, PropertyFactory } from "org.maplibre.android.style.layers"
 import { Expression } from "org.maplibre.android.style.expressions"
 import { GeoJsonSource, GeoJsonOptions } from "org.maplibre.android.style.sources"
 import { CircleLayer, SymbolLayer, HeatmapLayer } from "org.maplibre.android.style.layers"
-import { FeatureCollection, Feature, Point } from "org.maplibre.geojson"
+// v1.9.0: E0.3a styled 折线（LineLayer + GeoJsonSource）
+import { LineLayer } from "org.maplibre.android.style.layers"
+import { FeatureCollection, Feature, Point, LineString } from "org.maplibre.geojson"
 import { JsonObject } from "com.google.gson"
 import { CameraPosition, CameraUpdateFactory } from "org.maplibre.android.camera"
 import { LatLng } from "org.maplibre.android.geometry"
@@ -643,6 +645,75 @@ export function addPolyline(points: Array<MapClickDetail>, color: string, width:
     }
 }
 
+// ══════════════════════════════════════════════
+// v1.9.0 新增：E0.3a styled 折线（LineLayer+GeoJsonSource，虚线/透明度）
+// ══════════════════════════════════════════════
+// legacy addPolyline 走 PolylineOptions 注记路径（无 dash 能力，保持不动）；
+// styled 变体走 style 层系（source+layer），与 image 覆盖物同款 {source, layer} 包装与命名惯例
+type StyledPolylineEntry = { source: GeoJsonSource, layer: LineLayer }
+let styledPolylines: Array<StyledPolylineEntry> = []
+
+export function addStyledPolyline(points: Array<MapClickDetail>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+    const m = mapLibreMap
+    const style = m?.getStyle()
+    if (m == null || style == null || points.length < 2) return 0
+    const errorCb = onErrorCallback
+    // 预分配 ID 再建层（source/layer ID 与 overlay ID 绑定，对齐 img-overlay 命名惯例）
+    overlayIdCounter++
+    const id = overlayIdCounter
+    const sourceId = "styled-line-src-" + id
+    const layerId = "styled-line-layer-" + id
+    try {
+        const coords: Array<Point> = []
+        for (let i = 0; i < points.length; i++) {
+            coords.push(Point.fromLngLat(points[i].lng.toDouble(), points[i].lat.toDouble()))
+        }
+        const source = new GeoJsonSource(sourceId, LineString.fromLngLat(coords))
+        style.addSource(source)
+        const layer = new LineLayer(layerId, sourceId)
+        layer.setProperties(
+            PropertyFactory.lineColor(Color.parseColor(color)),
+            PropertyFactory.lineWidth(width.toFloat()),
+            PropertyFactory.lineOpacity((opacity ?? 1.0).toFloat())
+        )
+        // 虚线：Expression.literal(Number[]) 常量数组（UTS Array → toTypedArray() 转 kotlin.Array
+        // 即 java.lang.Double[]，数组协变匹配 Number[]；textFont(String[]) 同款转换先例）。
+        // 编译期验证项：若 SDK 版本无 lineDasharray(Expression) 重载，回退 Float[] 构造路径
+        if (dash != null && dash.length > 0) {
+            layer.setProperties(PropertyFactory.lineDasharray(Expression.literal(dash.toTypedArray())))
+        }
+        style.addLayer(layer)
+        const entryObj: StyledPolylineEntry = { source: source, layer: layer }
+        styledPolylines.push(entryObj)
+        overlayMap.set(id, { id: id, type: 'styledPolyline', nativeRef: entryObj, isVisible: true })
+        return id
+    } catch (e: any) {
+        console.error("TDTMap: 添加 styled 折线失败: " + e.message)
+        overlayMap.delete(id)
+        if (errorCb != null) {
+            errorCb({ code: 4, message: "添加 styled 折线失败: " + e.message })
+        }
+        return 0
+    }
+}
+
+// 清除全部 styled 折线（clearOverlays 调用；style 为空时仅清状态）
+function clearStyledPolylinesInternal(): void {
+    const style = mapLibreMap?.getStyle()
+    for (let i = 0; i < styledPolylines.length; i++) {
+        if (style != null) {
+            try {
+                style.removeLayer(styledPolylines[i].layer)
+                style.removeSource(styledPolylines[i].source)
+            } catch (e: any) {
+                console.error("TDTMap: clearStyledPolylines 移除失败: " + e.message)
+            }
+        }
+    }
+    clearOverlayType('styledPolyline')
+    styledPolylines = []
+}
+
 // ==================== 覆盖物：圆（多边形近似，36 边） ====================
 
 const EARTH_RADIUS = 6378137.0
@@ -752,6 +823,8 @@ export function clearOverlays(): void {
     clearPolygons()
     // v1.9.0: 清除图片覆盖物（style 层系，须逐个 removeLayer/removeSource；mapLibreMap 为空时仅清状态）
     clearImageOverlaysInternal()
+    // v1.9.0: 清除 styled 折线（style 层系，同上）
+    clearStyledPolylinesInternal()
     const m = mapLibreMap
     if (m == null) {
         clearOverlayType('polyline')
@@ -873,6 +946,8 @@ export function destroyMap(): void {
     imageOverlayExt = new Map<number, ImageOverlayExt>()
     imageOverlayIds = []
     imageOverlayClickCallback = null
+    // v1.9.0: styled 折线状态（source/layer 随 style 销毁，仅清引用）
+    styledPolylines = []
 }
 
 // ==================== 缩放控制 ====================
@@ -1109,6 +1184,19 @@ export function removeOverlay(id: number): void {
         } else if (entry.type == 'polyline') {
             m.removePolyline(ref as Polyline)
             polylineList = polylineList.filter(p => p !== ref)
+        } else if (entry.type == 'styledPolyline') {
+            // v1.9.0: styled 折线为 style 层系（source+layer），非 annotation 体系
+            const style = m.getStyle()
+            const spRef = ref as StyledPolylineEntry
+            if (style != null) {
+                try {
+                    style.removeLayer(spRef.layer)
+                    style.removeSource(spRef.source)
+                } catch (e2: any) {
+                    console.error("TDTMap: removeOverlay styled 折线移除失败: " + e2.message)
+                }
+            }
+            styledPolylines = styledPolylines.filter(sp => sp !== spRef)
         } else if (entry.type == 'image') {
             // v1.9.0: 图片覆盖物为 style 层系（source+layer），非 annotation 体系
             const style = m.getStyle()
@@ -1160,6 +1248,9 @@ export function showOverlay(id: number): void {
                 }
             } else if (entry.type == 'polyline') {
                 (ref as Polyline).setAlpha(1.0.toFloat())
+            } else if (entry.type == 'styledPolyline') {
+                // v1.9.0: LineLayer 须用 Layer.setVisible（显式拦截，防落入末尾 Polygon 分支）
+                (ref as StyledPolylineEntry).layer.setVisible(true)
             } else if (entry.type == 'image') {
                 // v1.9.0: RasterLayer 无 setAlpha，须用 Layer.setVisible（必须显式拦截，否则落入末尾 Polygon 分支）
                 (ref.layer as RasterLayer).setVisible(true)
@@ -1191,6 +1282,9 @@ export function hideOverlay(id: number): void {
                 }
             } else if (entry.type == 'polyline') {
                 (ref as Polyline).setAlpha(0.0.toFloat())
+            } else if (entry.type == 'styledPolyline') {
+                // v1.9.0: LineLayer 须用 Layer.setVisible（显式拦截，防落入末尾 Polygon 分支）
+                (ref as StyledPolylineEntry).layer.setVisible(false)
             } else if (entry.type == 'image') {
                 // v1.9.0: RasterLayer 无 setAlpha，须用 Layer.setVisible（必须显式拦截，否则落入末尾 Polygon 分支）
                 (ref.layer as RasterLayer).setVisible(false)

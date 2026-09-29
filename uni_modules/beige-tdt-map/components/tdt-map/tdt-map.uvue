@@ -129,7 +129,9 @@ import {
   updateImageOverlay as nativeUpdateImageOverlay,
   setImageOverlayClickCallback as nativeSetImageOverlayClickCallback,
   // v1.9.0: E0 GeoJSON 层重放通知（样式重建后由原生层触发组件层重放）
-  setGeoJsonReplayCallback as nativeSetGeoJsonReplayCallback
+  setGeoJsonReplayCallback as nativeSetGeoJsonReplayCallback,
+  // v1.9.0: E0.3a styled 折线（虚线/透明度）
+  addStyledPolyline as nativeAddStyledPolyline
 } from '@/uni_modules/beige-tdt-map'
 import globalConfig from '@/uni_modules/beige-tdt-map/config'
 import type { MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickDetail, GeoJsonLayerOptions } from '@/uni_modules/beige-tdt-map'
@@ -452,6 +454,15 @@ function drawPolyline(points: Array<GeoLatLng>, color: string, width: number): n
   }
   return addPolyline(detail, color, width)
 }
+
+// v1.9.0: E0.3a styled 折线（虚线/透明度；legacy drawPolyline 行为零变化）
+function drawStyledPolyline(points: Array<GeoLatLng>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+  const detail: Array<MapClickDetail> = []
+  for (let i = 0; i < points.length; i++) {
+    detail.push({ lat: points[i].latitude, lng: points[i].longitude })
+  }
+  return nativeAddStyledPolyline(detail, color, width, dash, opacity)
+}
 function drawCircle(lat: number, lng: number, radius: number, color: string, fillColor: string): number { return addCircle(lat, lng, radius, color, fillColor) }
 function drawRectangle(minLat: number, minLng: number, maxLat: number, maxLng: number, color: string, fillColor: string): number { return addRectangle(minLat, minLng, maxLat, maxLng, color, fillColor) }
 function drawLabel(lat: number, lng: number, text: string): number { return addLabel(lat, lng, text) }
@@ -625,7 +636,7 @@ let geoJsonLayerOptionsMap = new Map<number, GeoJsonLayerOptions>()  // 层 ID �
 let geoJsonLayerVisible = new Map<number, boolean>()                 // 层 ID → 可见性（重放后恢复隐藏态）
 
 // 内部编排：解析产物 → 逐 feature 逐 ring 调 draw 原语。
-// 描边（CP-2a 阶段为 drawPolyline 实线形态；CP-2b 起改走 drawStyledPolyline 承接 lineDash/opacity）；
+// 描边走 drawStyledPolyline（E0.3a：lineDash=null 实线 / 虚线如 [4,4]，opacity=1 对齐 chatbot）；
 // 填充仅作用外环（fill 自带 outline 传 fillColor 隐形化，描边统一由描边原语负责、线宽可控）；
 // 标注分支 CP-2a 暂不渲染（options.label 已完整解析入快照库，CP-2c 完成 drawStyledText 后接线）
 function buildGeoJsonOverlays(features: Array<GeoParsedFeature>, options: GeoJsonLayerOptions): Array<number> {
@@ -641,7 +652,7 @@ function buildGeoJsonOverlays(features: Array<GeoParsedFeature>, options: GeoJso
     }
     for (let j = 0; j < f.rings.length; j++) {
       ringCount++
-      const strokeId = drawPolyline(f.rings[j], options.lineColor, options.lineWidth)
+      const strokeId = drawStyledPolyline(f.rings[j], options.lineColor, options.lineWidth, options.lineDash, 1.0)
       if (strokeId > 0) ids.push(strokeId)
     }
     // 标注分支：CP-2c 接线（options.label 非空且 f.label 非空且锚点非空时 drawStyledText 于 f.anchor）
@@ -859,7 +870,7 @@ defineExpose({
   zoomInOne, zoomOutOne, setMinZoomLevel, setMaxZoomLevel,
   panToLocation, centerAtZoom, setZoomEnabled, setDragEnabled,
   setMapMaxBounds, getCurrentBounds, convertGcj02ToWgs84,
-  drawPolyline, drawCircle, drawRectangle, drawLabel, batchMarkers, clearAllOverlays,
+  drawPolyline, drawStyledPolyline, drawCircle, drawRectangle, drawLabel, batchMarkers, clearAllOverlays,
   removeOverlayById, showOverlayById, hideOverlayById,
   doCheckResize, doPlanBy, setViewportPoints, getMapSize,
   calculateDistance, calculateViewport, getMapCode,

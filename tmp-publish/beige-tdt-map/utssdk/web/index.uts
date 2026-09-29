@@ -835,6 +835,28 @@ export function addPolyline(points: Array<MapClickDetail>, color: string, width:
     return id
 }
 
+// v1.9.0: E0.3a styled 折线——line-dasharray/line-opacity 参数化；
+// legacy addPolyline 硬编码 line-opacity 0.8 保持零变化（缺省 opacity=1 仅属新原语）
+export function addStyledPolyline(points: Array<MapClickDetail>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+    if (mapInstance == null || points.length < 2) return 0
+    const coords: Array<Array<number>> = []
+    for (let i = 0; i < points.length; i++) {
+        coords.push([points[i].lng, points[i].lat])
+    }
+    const paint: any = {
+        'line-color': color,
+        'line-width': width,
+        'line-opacity': opacity ?? 1
+    }
+    if (dash != null && dash.length > 0) {
+        paint['line-dasharray'] = dash
+    }
+    const geojson: any = { type: 'Feature', geometry: { type: 'LineString', coordinates: coords } }
+    const id = addGeoJSONOverlay('line', geojson, paint)
+    if (id > 0) polylineList.push(id)
+    return id
+}
+
 export function addCircle(lat: number, lng: number, radius: number, color: string, fillColor: string): number {
     // 用 GeoJSON circle 近似：多个点模拟圆
     const coords: Array<Array<number>> = []
