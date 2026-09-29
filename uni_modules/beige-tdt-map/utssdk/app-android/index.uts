@@ -741,6 +741,8 @@ export function addStyledText(lat: number, lng: number, text: string, options: S
     const style = m?.getStyle()
     if (m == null || style == null || text.length == 0) return 0
     const errorCb = onErrorCallback
+    // 位图外提声明：catch 路径可回收（v1.9.1 F7——native 内存不依赖 GC 兜底）
+    let bmp: Bitmap | null = null
     try {
         // 位图按物理像素乘 density 绘制（bounds 按逻辑尺寸换算，位图拉伸到 bounds 后保持锐利）
         const ctx = mapView?.getContext()
@@ -760,8 +762,8 @@ export function addStyledText(lat: number, lng: number, text: string, options: S
         const bmpW = Math.ceil(textWidth.toDouble() + pad * 2).toInt()
         const bmpH = Math.ceil(textHeight + pad * 2).toInt()
         if (bmpW <= 0 || bmpH <= 0) return 0
-        const bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
-        const canvas = new Canvas(bmp)
+        bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
+        const canvas = new Canvas(bmp!)
         // 文字基线：ascent 为负值，baselineY = pad - ascent 使文本顶部落在 pad
         const baselineY = (pad - fm.ascent.toDouble())
         if (options.haloColor != null && haloWidthPx > 0) {
@@ -785,7 +787,7 @@ export function addStyledText(lat: number, lng: number, text: string, options: S
         const latRad = lat * Math.PI / 180
         const halfLat = (logicalH / 2) * 360 / worldPx / Math.cos(latRad)
         if (!(halfLng > 0) || !(halfLat > 0)) {
-            bmp.recycle()
+            bmp!.recycle()
             return 0
         }
 
@@ -802,10 +804,14 @@ export function addStyledText(lat: number, lng: number, text: string, options: S
             clickable: false
         }
         overlayMap.set(id, { id: id, type: 'styledText', nativeRef: null, isVisible: true })
-        attachImageOverlayToStyle(id, params, style, bmp)
+        attachImageOverlayToStyle(id, params, style, bmp!)
         return id
     } catch (e: any) {
         console.error("TDTMap: 添加 styled 文本失败: " + e.message)
+        // v1.9.1 F7：位图已创建但中途失败时立即回收，不依赖 GC 兜底
+        if (bmp != null) {
+            bmp!.recycle()
+        }
         if (errorCb != null) {
             errorCb({ code: 4, message: "添加 styled 文本失败: " + e.message })
         }
@@ -2092,6 +2098,20 @@ function placeImageLayerByZIndex(style: Style, layer: RasterLayer, z: number | n
     if (z != null && z <= 0) {
         if (style.getLayer("tdt-label-layer") != null) {
             style.addLayerBelow(layer, "tdt-label-layer")
+        } else if (currentMapType == 'blank') {
+            // v1.9.1: blank 白底无注记层——插到首个非背景层之下（用户矢量层之底）；
+            // 无用户层时置顶（后续用户层 append 仍会盖其上），保证 zIndex<=0 图层恒在矢量层之下
+            const layersAll = style.getLayers()
+            if (layersAll != null) {
+                const all = Array.fromNative(layersAll)
+                for (let j = 0; j < all.length; j++) {
+                    const lid = (all[j] as any).getId() as string
+                    if (lid == 'tdt-bg') continue
+                    style.addLayerBelow(layer, lid)
+                    return
+                }
+            }
+            style.addLayer(layer)
         } else {
             const lowestId = lowestImageLayerIdAndroid(style, excludeId)
             if (lowestId.length > 0) {

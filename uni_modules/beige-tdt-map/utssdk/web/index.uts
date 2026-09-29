@@ -1918,6 +1918,18 @@ function addImageOverlayInternal(params: ImageOverlayOptions, replayId: number):
             //（无其他图片层则置顶，防止静默丢层——与瓦片层回退初衷一致）
             if (map.getLayer('tdt-anno-layer') != null) {
                 map.addLayer(layerDef, 'tdt-anno-layer')
+            } else if (currentMapType == 'blank') {
+                // v1.9.1: blank 白底无注记层——插到首个非 background 层之下（用户层之底）；
+                // 无用户层时置顶（后续用户层 append 仍会盖其上），保证 zIndex<=0 图层恒在矢量层之下
+                const layersAll = map.getStyle()?.layers
+                if (layersAll != null) {
+                    for (let j = 0; j < layersAll.length; j++) {
+                        if (layersAll[j].type == 'background') continue
+                        map.addLayer(layerDef, layersAll[j].id)
+                        return
+                    }
+                }
+                map.addLayer(layerDef)
             } else {
                 const lowestId = lowestImageLayerId(replayId)
                 if (lowestId.length > 0) {
