@@ -80,6 +80,15 @@
     <button onclick="testV180RemoveStyle()">3.removeStyle</button>
     <button onclick="testV180Misc()">4.边界/canvas</button>
   </div>
+  <div class="grp"><h4>v1.9.0 图片覆盖物</h4>
+    <button onclick="testV190Add()">1.添加+四角/透明度</button>
+    <button onclick="testV190Bearing()">2.bearing 旋转</button>
+    <button onclick="testV190ZIndex()">3.zIndex 三档</button>
+    <button onclick="testV190Update()">4.update 更新</button>
+    <button onclick="testV190Click()">5.点击互斥</button>
+    <button onclick="testV190Mgmt()">6.显隐/移除</button>
+    <button onclick="testV190Rebuild()">7.setStyle 重建</button>
+  </div>
   <div class="grp"><h4>天地图 Web API（重点）</h4>
     <button onclick="testGeocoderFormats()">geocoder 格式对比</button>
     <button onclick="testSearchQueryTypes()">v2/search 各 queryType</button>
@@ -158,7 +167,7 @@ function genOverlayId() { nextOverlayId++; return nextOverlayId; }
 
 function initMap() {
   const { apiKey } = getKeys();
-  if (!apiKey) { log('请先输入天地图 Key', 'fail'); return; }
+  // v1.9.0：无 Key 也允许初始化（空样式）——图片覆盖物等非底图功能不依赖天地图底图
   if (map) { map.remove(); map = null; }
   markerMap.clear(); overlayMap.clear(); markerInfoMap.clear();
   polygonList = []; polylineList = []; circleList = []; rectangleList = []; labelList = [];
@@ -186,6 +195,10 @@ function initMap() {
   map.addControl(scaleControl, 'bottom-right');
 
   map.on('load', () => {
+    if (!apiKey) {
+      log('未提供 Key：跳过天地图底图（可测试 v1.9.0 图片覆盖物等非底图功能）', 'warn');
+      return;
+    }
     map.addSource('tdt-base', { type: 'raster', tiles: [tileUrl(LAYERS[currentType].map, apiKey)], tileSize: 256, maxzoom: 18, minzoom: 1 });
     map.addLayer({ id: 'tdt-base-layer', type: 'raster', source: 'tdt-base' });
     map.addSource('tdt-anno', { type: 'raster', tiles: [tileUrl(LAYERS[currentType].anno, apiKey)], tileSize: 256, maxzoom: 18, minzoom: 1 });
@@ -194,13 +207,32 @@ function initMap() {
   });
 
   map.on('click', (e) => {
+    // v1.9.0 复刻：图片覆盖物几何命中检测（顶→底，命中即互斥消费 mapClick）
+    // 不用 queryRenderedFeatures（raster 图层无要素）
+    if (imageOverlayClickCallback != null && imageOverlayIdsPoc.length > 0) {
+      let hitId = 0, hitKey = -2000000, hitIdx = -1;
+      for (let i = 0; i < imageOverlayIdsPoc.length; i++) {
+        const oid = imageOverlayIdsPoc[i];
+        const info = imageOverlaysPoc.get(oid);
+        if (info == null || !info.visible || info.params.clickable === false) continue;
+        if (!hitTestImageOverlay(e.lngLat.lat, e.lngLat.lng, info.params)) continue;
+        const key = imageOverlayZKey(info.params.zIndex == null ? null : info.params.zIndex);
+        if (key > hitKey || (key === hitKey && i > hitIdx)) { hitId = oid; hitKey = key; hitIdx = i; }
+      }
+      if (hitId > 0) {
+        imageOverlayClickCallback({ id: hitId, lat: e.lngLat.lat, lng: e.lngLat.lng });
+        return;
+      }
+    }
     // 聚合图层不存在时 queryRenderedFeatures 会抛错（MapLibre 行为），先判空
     if (map.getLayer('tdt-cluster-layer') == null) {
+      v190MapClickCount++;
       log('地图点击: ' + e.lngLat.lat.toFixed(5) + ', ' + e.lngLat.lng.toFixed(5), 'info');
       return;
     }
     const clusterHits = map.queryRenderedFeatures(e.point, { layers: ['tdt-cluster-layer'] });
     if (clusterHits != null && clusterHits.length > 0) return;
+    v190MapClickCount++;
     log('地图点击: ' + e.lngLat.lat.toFixed(5) + ', ' + e.lngLat.lng.toFixed(5), 'info');
   });
   map.on('moveend', () => { /* cameraChange 复刻 */ });
@@ -212,6 +244,9 @@ function initMap() {
 
 function destroyTest() {
   if (map) { try { map.remove(); } catch (e) {} map = null; }
+  // v1.9.0: 图片覆盖物状态重置
+  imageOverlaysPoc.clear(); imageOverlayIdsPoc = [];
+  imageOverlayClickCallback = null; v190MapClickCount = 0;
   log('地图已销毁');
 }
 
@@ -340,6 +375,9 @@ function removeOverlayPoc(id) {
   circleList = circleList.filter(x => x !== id);
   rectangleList = rectangleList.filter(x => x !== id);
   labelList = labelList.filter(x => x !== id);
+  // v1.9.0 复刻：图片覆盖物状态同步清理
+  imageOverlaysPoc.delete(id);
+  imageOverlayIdsPoc = imageOverlayIdsPoc.filter(x => x !== id);
 }
 function hideOverlayPoc(id) {
   const entry = overlayMap.get(id);
@@ -351,6 +389,9 @@ function hideOverlayPoc(id) {
     try { map.setLayoutProperty(entry.layerId, 'visibility', 'none'); } catch (e) {}
   }
   entry.visible = false;
+  // v1.9.0 复刻：图片覆盖物可见性状态同步（hit-test 与重建读取）
+  const imgHide = imageOverlaysPoc.get(id);
+  if (imgHide != null) { imgHide.visible = false; imgHide.params.visible = false; }
 }
 function showOverlayPoc(id) {
   const entry = overlayMap.get(id);
@@ -362,6 +403,9 @@ function showOverlayPoc(id) {
     try { map.setLayoutProperty(entry.layerId, 'visibility', 'visible'); } catch (e) {}
   }
   entry.visible = true;
+  // v1.9.0 复刻：图片覆盖物可见性状态同步（hit-test 与重建读取）
+  const imgShow = imageOverlaysPoc.get(id);
+  if (imgShow != null) { imgShow.visible = true; imgShow.params.visible = true; }
 }
 function clearMarkersPoc() {
   if (map == null) return;
@@ -1037,6 +1081,17 @@ function rebuildPoc() {
   }
   pocV180TileLayers.clear();
   for (const s of saved) addCustomTilePoc(s.id, s.info.tileUrl, s.info.options);
+  // v1.9.0 复刻：图片覆盖物重放（快照 params → 清状态 → 按原 ID 与添加顺序重建）
+  if (imageOverlayIdsPoc.length > 0) {
+    const savedImgs = [];
+    for (const oid of imageOverlayIdsPoc) {
+      const info = imageOverlaysPoc.get(oid);
+      if (info != null) savedImgs.push({ id: oid, params: info.params });
+    }
+    imageOverlaysPoc.clear();
+    imageOverlayIdsPoc = [];
+    for (const s of savedImgs) addImageOverlayInternalPoc(s.params, s.id);
+  }
 }
 
 function registerStyleLoadPoc(fn) {
@@ -1097,9 +1152,371 @@ function testV180Misc() {
   try {
     if (!map) { log('请先加载地图', 'fail'); return; }
     map.setMaxBounds(null);
-    record('v1.8.0 setMaxBounds(null) 清除', map.getBounds() != null, '清除后地图可自由操作');
+    record('v1.8.0 setMaxBounds(null) 清除', map.getBounds() != null, '清除后地 图可自由操作');
     record('v1.8.0 isSupportCanvas', true, 'Web 端恒 true（复刻 return true）');
   } catch (e) { record('testV180Misc', false, String(e)); }
+}
+
+// ═══════════════════════════════════════════════════════
+// v1.9.0: 图片覆盖物（与 web/index.uts 同构复刻）
+// 点击检测用几何 hit-test（raster 图层无要素，queryRenderedFeatures 不可用）
+// ═══════════════════════════════════════════════════════
+const imageOverlaysPoc = new Map();   // id → {params, sourceId, layerId, visible}
+let imageOverlayIdsPoc = [];
+let imageOverlayClickCallback = null;
+let v190MapClickCount = 0;
+// 1x1 红色像素 data URL：零网络零 CORS 依赖，保障测试确定性（真实网络图加载走 demo 手测）
+const V190_IMG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+function imageOverlayZKey(z) {
+  if (z == null) return 1000000;
+  if (z <= 0) return -1;
+  return z;
+}
+function imageOverlayBeforeLayerId(newKey, excludeId) {
+  for (let i = 0; i < imageOverlayIdsPoc.length; i++) {
+    const oid = imageOverlayIdsPoc[i];
+    if (oid === excludeId) continue;
+    const info = imageOverlaysPoc.get(oid);
+    if (info == null) continue;
+    const key = imageOverlayZKey(info.params.zIndex == null ? null : info.params.zIndex);
+    if (key > newKey) return info.layerId;
+  }
+  return '';
+}
+// 图片层渲染序定位：zIndex=0 档无注记层时的降级锚点（与插件 add/update 两分支一致）
+function lowestImageLayerId(excludeId) {
+  if (!map) return '';
+  const layers = map.getStyle().layers;
+  let lowestId = '', lowestIdx = 2147483647;
+  for (const oid of imageOverlayIdsPoc) {
+    if (oid === excludeId) continue;
+    const info = imageOverlaysPoc.get(oid);
+    if (info == null || map.getLayer(info.layerId) == null) continue;
+    for (let j = 0; j < layers.length; j++) {
+      if (layers[j].id === info.layerId && j < lowestIdx) { lowestIdx = j; lowestId = info.layerId; break; }
+    }
+  }
+  return lowestId;
+}
+function mercatorY(lat) { const rad = lat * Math.PI / 180.0; return Math.log(Math.tan(Math.PI / 4.0 + rad / 2.0)); }
+function inverseMercatorY(y) { return (2.0 * Math.atan(Math.exp(y)) - Math.PI / 2.0) * 180.0 / Math.PI; }
+function computeImageQuad(sw, ne, bearing) {
+  const corners = [[sw.lng, ne.lat], [ne.lng, ne.lat], [ne.lng, sw.lat], [sw.lng, sw.lat]];
+  if (bearing === 0) return corners;
+  const rad = -bearing * Math.PI / 180.0;
+  const cx = (sw.lng + ne.lng) / 2.0;
+  const cyM = (mercatorY(sw.lat) + mercatorY(ne.lat)) / 2.0;
+  const out = [];
+  for (let i = 0; i < 4; i++) {
+    const x = corners[i][0] - cx;
+    const y = mercatorY(corners[i][1]) - cyM;
+    const rx = x * Math.cos(rad) - y * Math.sin(rad);
+    const ry = x * Math.sin(rad) + y * Math.cos(rad);
+    out.push([cx + rx, inverseMercatorY(cyM + ry)]);
+  }
+  return out;
+}
+function hitTestImageOverlay(lat, lng, params) {
+  const sw = params.southwest, ne = params.northeast;
+  const bearing = params.bearing == null ? 0 : params.bearing;
+  if (bearing === 0) {
+    return lat >= sw.lat && lat <= ne.lat && lng >= sw.lng && lng <= ne.lng;
+  }
+  const rad = bearing * Math.PI / 180.0;
+  const cx = (sw.lng + ne.lng) / 2.0;
+  const cyM = (mercatorY(sw.lat) + mercatorY(ne.lat)) / 2.0;
+  const x = lng - cx;
+  const y = mercatorY(lat) - cyM;
+  const rx = x * Math.cos(rad) - y * Math.sin(rad);
+  const ry = x * Math.sin(rad) + y * Math.cos(rad);
+  const halfW = (ne.lng - sw.lng) / 2.0;
+  const halfH = (mercatorY(ne.lat) - mercatorY(sw.lat)) / 2.0;
+  return Math.abs(rx) <= halfW && Math.abs(ry) <= halfH;
+}
+function isValidWebImageUrl(url) {
+  return url.indexOf('http://') === 0 || url.indexOf('https://') === 0 || url.indexOf('data:') === 0;
+}
+function addImageOverlayInternalPoc(params, replayId) {
+  if (!map) return 0;
+  if (!isValidWebImageUrl(params.image)) return 0; // 复刻：非法地址返回 0（onError 由插件层上报，POC 不复刻）
+  const id = replayId > 0 ? replayId : genOverlayId();
+  const sourceId = 'img-overlay-src-' + id;
+  const layerId = 'img-overlay-layer-' + id;
+  try {
+    map.addSource(sourceId, {
+      type: 'image',
+      url: params.image,
+      coordinates: computeImageQuad(params.southwest, params.northeast, params.bearing == null ? 0 : params.bearing)
+    });
+    const layerDef = { id: layerId, type: 'raster', source: sourceId,
+      paint: { 'raster-opacity': 1.0 - (params.transparency == null ? 0 : params.transparency) } };
+    if (params.visible === false) layerDef.layout = { visibility: 'none' };
+    const z = params.zIndex;
+    if (z != null && z <= 0) {
+      if (map.getLayer('tdt-anno-layer') != null) map.addLayer(layerDef, 'tdt-anno-layer');
+      else {
+        const lowestId = lowestImageLayerId(replayId);
+        if (lowestId.length > 0) map.addLayer(layerDef, lowestId);
+        else map.addLayer(layerDef);
+        log('zIndex=0 但无注记层，已按图片层最下处理（与插件一致）', 'warn');
+      }
+    } else {
+      const beforeId = imageOverlayBeforeLayerId(imageOverlayZKey(z), replayId);
+      if (beforeId.length > 0) map.addLayer(layerDef, beforeId);
+      else map.addLayer(layerDef);
+    }
+    const visible = params.visible !== false;
+    imageOverlaysPoc.set(id, { params: params, sourceId: sourceId, layerId: layerId, visible: visible });
+    overlayMap.set(id, { type: 'image', sourceId: sourceId, layerId: layerId, visible: visible });
+    imageOverlayIdsPoc.push(id);
+    return id;
+  } catch (e) {
+    record('addImageOverlayInternalPoc 异常', false, String(e));
+    return 0;
+  }
+}
+function addImageOverlayPoc(params) { return addImageOverlayInternalPoc(params, 0); }
+function updateImageOverlayPoc(id, changes) {
+  const info = imageOverlaysPoc.get(id);
+  if (info == null || map == null) return;
+  const p = info.params;
+  const oldZ = p.zIndex == null ? null : p.zIndex;
+  if (changes.image != null && !isValidWebImageUrl(changes.image)) return;
+  if (changes.southwest != null) p.southwest = changes.southwest;
+  if (changes.northeast != null) p.northeast = changes.northeast;
+  if (changes.image != null) p.image = changes.image;
+  if (changes.transparency != null) p.transparency = changes.transparency;
+  if (changes.zIndex != null) p.zIndex = changes.zIndex;
+  if (changes.bearing != null) p.bearing = changes.bearing;
+  if (changes.visible != null) p.visible = changes.visible;
+  if (changes.clickable != null) p.clickable = changes.clickable;
+  try {
+    if (changes.image != null || changes.southwest != null || changes.northeast != null || changes.bearing != null) {
+      const src = map.getSource(info.sourceId);
+      if (src != null && src.updateImage != null) {
+        src.updateImage({ url: p.image, coordinates: computeImageQuad(p.southwest, p.northeast, p.bearing == null ? 0 : p.bearing) });
+      }
+    }
+    if (changes.transparency != null) {
+      map.setPaintProperty(info.layerId, 'raster-opacity', 1.0 - (p.transparency == null ? 0 : p.transparency));
+    }
+    if (changes.visible != null) {
+      const visible = p.visible !== false;
+      map.setLayoutProperty(info.layerId, 'visibility', visible ? 'visible' : 'none');
+      info.visible = visible;
+      const entry = overlayMap.get(id);
+      if (entry != null) entry.visible = visible;
+    }
+    if (changes.zIndex != null && imageOverlayZKey(p.zIndex) !== imageOverlayZKey(oldZ) && map.getLayer(info.layerId) != null) {
+      const z = p.zIndex;
+      if (z != null && z <= 0) {
+        if (map.getLayer('tdt-anno-layer') != null) map.moveLayer(info.layerId, 'tdt-anno-layer');
+        else {
+          const lowestId = lowestImageLayerId(id);
+          if (lowestId.length > 0) map.moveLayer(info.layerId, lowestId);
+        }
+      } else {
+        const beforeId = imageOverlayBeforeLayerId(imageOverlayZKey(z), id);
+        if (beforeId.length > 0) map.moveLayer(info.layerId, beforeId);
+        else map.moveLayer(info.layerId);
+      }
+    }
+  } catch (e) { record('updateImageOverlayPoc 异常', false, String(e)); }
+}
+
+// ── v1.9.0 测试工具 ──
+function approxNum(a, b, eps) { return Math.abs(a - b) <= (eps || 1e-9); }
+function layerOrderIndex(layerId) {
+  const layers = map.getStyle().layers;
+  for (let i = 0; i < layers.length; i++) if (layers[i].id === layerId) return i;
+  return -1;
+}
+function fireMapClickAt(lat, lng) {
+  const point = map.project([lng, lat]);
+  map.fire('click', { lngLat: map.unproject(point), point: point });
+}
+function clearAllV190Images() {
+  const ids = imageOverlayIdsPoc.slice();
+  for (const id of ids) removeOverlayPoc(id);
+}
+
+async function testV190Add() {
+  try {
+    if (!map) { log('请先加载地图', 'fail'); return; }
+    clearAllV190Images();
+    const id = addImageOverlayPoc({ southwest: { lat: 39.90, lng: 116.38 }, northeast: { lat: 39.92, lng: 116.42 }, image: V190_IMG, transparency: 0.3 });
+    await new Promise(r => setTimeout(r, 300));
+    record('v1.9.0 添加返回 ID', id > 0);
+    const src = map.getSource('img-overlay-src-' + id);
+    record('v1.9.0 image source 创建', src != null);
+    let ok = false, coordsStr = '';
+    if (src != null) {
+      const c = src.coordinates;
+      coordsStr = JSON.stringify(c.map(p => [p[0].toFixed(4), p[1].toFixed(4)]));
+      ok = c.length === 4 && approxNum(c[0][0], 116.38) && approxNum(c[0][1], 39.92)
+        && approxNum(c[1][0], 116.42) && approxNum(c[1][1], 39.92)
+        && approxNum(c[2][0], 116.42) && approxNum(c[2][1], 39.90)
+        && approxNum(c[3][0], 116.38) && approxNum(c[3][1], 39.90);
+    }
+    record('v1.9.0 四角顺序 [nw,ne,se,sw]', ok, coordsStr);
+    record('v1.9.0 raster layer 创建', map.getLayer('img-overlay-layer-' + id) != null);
+    record('v1.9.0 transparency→raster-opacity=0.7', Math.abs(map.getPaintProperty('img-overlay-layer-' + id, 'raster-opacity') - 0.7) < 0.001);
+    const bad = addImageOverlayPoc({ southwest: { lat: 39.90, lng: 116.38 }, northeast: { lat: 39.92, lng: 116.42 }, image: '/local/cache/a.png' });
+    record('v1.9.0 本机路径返回 0（Web 限制）', bad === 0);
+  } catch (e) { record('testV190Add', false, String(e)); }
+}
+
+async function testV190Bearing() {
+  try {
+    if (!map) { log('请先加载地图', 'fail'); return; }
+    clearAllV190Images();
+    const sw = { lat: 39.90, lng: 116.38 }, ne = { lat: 39.92, lng: 116.42 };
+    const id = addImageOverlayPoc({ southwest: sw, northeast: ne, image: V190_IMG, bearing: 30 });
+    await new Promise(r => setTimeout(r, 300));
+    const src = map.getSource('img-overlay-src-' + id);
+    let ok = false, detail = 'source 缺失';
+    if (src != null) {
+      const c = src.coordinates;
+      // 独立复算 nw 角（不经 computeImageQuad，交叉验证）：30° 顺时针旋转
+      const rad = -30 * Math.PI / 180;
+      const cx = (sw.lng + ne.lng) / 2, cyM = (mercatorY(sw.lat) + mercatorY(ne.lat)) / 2;
+      const x = sw.lng - cx, y = mercatorY(ne.lat) - cyM;
+      const ex = cx + x * Math.cos(rad) - y * Math.sin(rad);
+      const ey = inverseMercatorY(cyM + x * Math.sin(rad) + y * Math.cos(rad));
+      ok = approxNum(c[0][0], ex, 1e-12) && approxNum(c[0][1], ey, 1e-12);
+      detail = '期望 [' + ex.toFixed(6) + ',' + ey.toFixed(6) + '] 实际 [' + c[0][0].toFixed(6) + ',' + c[0][1].toFixed(6) + ']';
+    }
+    record('v1.9.0 bearing=30 旋转角坐标（独立复算交叉验证）', ok, detail);
+    const p = { southwest: sw, northeast: ne, bearing: 30, image: '' };
+    record('v1.9.0 bearing hit-test 中心命中', hitTestImageOverlay((sw.lat + ne.lat) / 2, (sw.lng + ne.lng) / 2, p));
+    record('v1.9.0 bearing hit-test 原角点排除', !hitTestImageOverlay(ne.lat, sw.lng, p), '30° 时原 nw 角点在旋转矩形外');
+  } catch (e) { record('testV190Bearing', false, String(e)); }
+}
+
+async function testV190ZIndex() {
+  try {
+    if (!map) { log('请先加载地图', 'fail'); return; }
+    clearAllV190Images();
+    const mk = (z) => ({ southwest: { lat: 39.90, lng: 116.38 }, northeast: { lat: 39.92, lng: 116.42 }, image: V190_IMG, zIndex: z });
+    const id0 = addImageOverlayPoc(mk(0));
+    const id5 = addImageOverlayPoc(mk(5));
+    const id10 = addImageOverlayPoc(mk(10));
+    const idTop = addImageOverlayPoc({ southwest: { lat: 39.90, lng: 116.38 }, northeast: { lat: 39.92, lng: 116.42 }, image: V190_IMG });
+    await new Promise(r => setTimeout(r, 300));
+    const L5 = layerOrderIndex('img-overlay-layer-' + id5);
+    const L10 = layerOrderIndex('img-overlay-layer-' + id10);
+    const LT = layerOrderIndex('img-overlay-layer-' + idTop);
+    record('v1.9.0 正 zIndex 降序排布 + 缺省置顶', L5 >= 0 && L5 < L10 && L10 < LT);
+    const id7 = addImageOverlayPoc(mk(7));
+    await new Promise(r => setTimeout(r, 100));
+    // 插入新层会使上方层索引 +1，须重新取 id10 的当前索引
+    const L7 = layerOrderIndex('img-overlay-layer-' + id7);
+    const L10n = layerOrderIndex('img-overlay-layer-' + id10);
+    record('v1.9.0 后加 zIndex=7 插入 5~10 之间', L7 > L5 && L7 < L10n);
+    const L0 = layerOrderIndex('img-overlay-layer-' + id0);
+    const annoIdx = layerOrderIndex('tdt-anno-layer');
+    if (annoIdx >= 0) {
+      record('v1.9.0 zIndex=0 位于注记层之下', L0 >= 0 && L0 < annoIdx, '有底图场景');
+    } else {
+      record('v1.9.0 zIndex=0 无注记层降级图片层最下', L0 >= 0 && L0 < layerOrderIndex('img-overlay-layer-' + id5), '0 档位于其他图片层之下');
+    }
+  } catch (e) { record('testV190ZIndex', false, String(e)); }
+}
+
+async function testV190Update() {
+  try {
+    if (!map) { log('请先加载地图', 'fail'); return; }
+    clearAllV190Images();
+    const id = addImageOverlayPoc({ southwest: { lat: 39.90, lng: 116.38 }, northeast: { lat: 39.92, lng: 116.42 }, image: V190_IMG, transparency: 0 });
+    const other = addImageOverlayPoc({ southwest: { lat: 39.90, lng: 116.38 }, northeast: { lat: 39.92, lng: 116.42 }, image: V190_IMG, zIndex: 50 });
+    await new Promise(r => setTimeout(r, 300));
+    updateImageOverlayPoc(id, { transparency: 0.6 });
+    record('v1.9.0 update transparency', Math.abs(map.getPaintProperty('img-overlay-layer-' + id, 'raster-opacity') - 0.4) < 0.001);
+    updateImageOverlayPoc(id, { southwest: { lat: 39.91, lng: 116.39 }, bearing: 45 });
+    await new Promise(r => setTimeout(r, 200));
+    const src = map.getSource('img-overlay-src-' + id);
+    let ok = false, detail = 'source 缺失';
+    if (src != null) {
+      const c = src.coordinates;
+      // 旋转四角在 Mercator 空间中心对称，均值须在 Mercator 空间比较（纬度反投影非线性，直接均值会拉偏）
+      const meanLng = (c[0][0] + c[1][0] + c[2][0] + c[3][0]) / 4;
+      const meanMercY = (mercatorY(c[0][1]) + mercatorY(c[1][1]) + mercatorY(c[2][1]) + mercatorY(c[3][1])) / 4;
+      const cyM = (mercatorY(39.91) + mercatorY(39.92)) / 2;
+      ok = approxNum(meanLng, (116.39 + 116.42) / 2, 1e-9) && approxNum(meanMercY, cyM, 1e-9);
+      detail = '中心 lng=' + meanLng.toFixed(5) + ' mercYΔ=' + Math.abs(meanMercY - cyM).toExponential(2);
+    }
+    record('v1.9.0 update bounds/bearing 后中心保持（updateImage，Mercator 均值）', ok, detail);
+    updateImageOverlayPoc(id, { visible: false });
+    record('v1.9.0 update visible=false', map.getLayoutProperty('img-overlay-layer-' + id, 'visibility') === 'none');
+    updateImageOverlayPoc(id, { visible: true });
+    record('v1.9.0 update visible=true', map.getLayoutProperty('img-overlay-layer-' + id, 'visibility') === 'visible');
+    // 先升后降验证真实移动：zIndex=100 升到 other 之上，再降 0 档回到 other 之下
+    updateImageOverlayPoc(id, { zIndex: 100 });
+    const upIdx = layerOrderIndex('img-overlay-layer-' + id);
+    const otherIdx = layerOrderIndex('img-overlay-layer-' + other);
+    updateImageOverlayPoc(id, { zIndex: 0 });
+    const downIdx = layerOrderIndex('img-overlay-layer-' + id);
+    record('v1.9.0 update zIndex 升降重排（无注记层降级图片层最下）', upIdx > otherIdx && downIdx < layerOrderIndex('img-overlay-layer-' + other));
+  } catch (e) { record('testV190Update', false, String(e)); }
+}
+
+async function testV190Click() {
+  try {
+    if (!map) { log('请先加载地图', 'fail'); return; }
+    clearAllV190Images();
+    const idA = addImageOverlayPoc({ southwest: { lat: 39.90, lng: 116.38 }, northeast: { lat: 39.92, lng: 116.42 }, image: V190_IMG });
+    const idB = addImageOverlayPoc({ southwest: { lat: 39.93, lng: 116.38 }, northeast: { lat: 39.95, lng: 116.42 }, image: V190_IMG, clickable: false });
+    await new Promise(r => setTimeout(r, 300));
+    let hits = [];
+    imageOverlayClickCallback = (d) => hits.push(d);
+    v190MapClickCount = 0;
+    fireMapClickAt(39.91, 116.40); // A 中心
+    await new Promise(r => setTimeout(r, 50));
+    record('v1.9.0 覆盖物内点击触发回调（含点击点坐标）', hits.length === 1 && hits[0].id === idA && approxNum(hits[0].lat, 39.91, 1e-6) && approxNum(hits[0].lng, 116.40, 1e-6), JSON.stringify(hits));
+    record('v1.9.0 覆盖物内点击互斥消费 mapClick', v190MapClickCount === 0);
+    hits = [];
+    fireMapClickAt(39.94, 116.40); // B 中心（clickable=false）
+    await new Promise(r => setTimeout(r, 50));
+    record('v1.9.0 clickable=false 不触发回调', hits.length === 0);
+    record('v1.9.0 clickable=false 穿透触发 mapClick', v190MapClickCount === 1);
+    fireMapClickAt(39.85, 116.30); // 覆盖物外
+    await new Promise(r => setTimeout(r, 50));
+    record('v1.9.0 覆盖物外触发 mapClick', v190MapClickCount === 2);
+    imageOverlayClickCallback = null;
+  } catch (e) { record('testV190Click', false, String(e)); }
+}
+
+async function testV190Mgmt() {
+  try {
+    if (!map) { log('请先加载地图', 'fail'); return; }
+    clearAllV190Images();
+    const id = addImageOverlayPoc({ southwest: { lat: 39.90, lng: 116.38 }, northeast: { lat: 39.92, lng: 116.42 }, image: V190_IMG });
+    await new Promise(r => setTimeout(r, 300));
+    const layerId = 'img-overlay-layer-' + id;
+    hideOverlayPoc(id);
+    record('v1.9.0 hideOverlay 布局隐藏', map.getLayoutProperty(layerId, 'visibility') === 'none');
+    record('v1.9.0 hideOverlay 状态同步', imageOverlaysPoc.get(id).visible === false && imageOverlaysPoc.get(id).params.visible === false);
+    showOverlayPoc(id);
+    record('v1.9.0 showOverlay 恢复', map.getLayoutProperty(layerId, 'visibility') === 'visible');
+    removeOverlayPoc(id);
+    record('v1.9.0 removeOverlay 移除 source/layer', map.getSource('img-overlay-src-' + id) == null && map.getLayer(layerId) == null);
+    record('v1.9.0 removeOverlay 状态清理', imageOverlaysPoc.get(id) == null && imageOverlayIdsPoc.indexOf(id) < 0);
+  } catch (e) { record('testV190Mgmt', false, String(e)); }
+}
+
+async function testV190Rebuild() {
+  try {
+    if (!map) { log('请先加载地图', 'fail'); return; }
+    clearAllV190Images();
+    const id = addImageOverlayPoc({ southwest: { lat: 39.90, lng: 116.38 }, northeast: { lat: 39.92, lng: 116.42 }, image: V190_IMG, transparency: 0.2 });
+    await new Promise(r => setTimeout(r, 300));
+    map.setStyle({ version: 8, glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf', sources: {}, layers: [] });
+    registerStyleLoadPoc(() => { rebuildPoc(); });
+    await new Promise(r => setTimeout(r, 1500));
+    record('v1.9.0 setStyle 后图片层重建（同 ID）', map.getSource('img-overlay-src-' + id) != null && map.getLayer('img-overlay-layer-' + id) != null);
+    record('v1.9.0 重建后状态一致（含透明度）', imageOverlaysPoc.get(id) != null && imageOverlayIdsPoc.indexOf(id) >= 0 && Math.abs(map.getPaintProperty('img-overlay-layer-' + id, 'raster-opacity') - 0.8) < 0.001);
+  } catch (e) { record('testV190Rebuild', false, String(e)); }
 }
 </script>
 </body>

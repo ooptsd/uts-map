@@ -1618,6 +1618,32 @@ function imageOverlayBeforeLayerId(newKey: number, excludeId: number): string {
     return ''
 }
 
+// 图片层渲染序定位：返回 excludeId 之外渲染序最靠前（最下方）的图片层 layerId；空串表示无
+// （zIndex=0 档无注记层时的降级锚点，保证 add/update 两分支行为一致；图片层数量少，双层遍历可接受）
+function lowestImageLayerId(excludeId: number): string {
+    const map = mapInstance
+    if (map == null) return ''
+    const layers = map.getStyle()?.layers
+    if (layers == null) return ''
+    let lowestId = ''
+    let lowestIdx = 2147483647
+    for (let i = 0; i < imageOverlayIds.length; i++) {
+        const oid = imageOverlayIds[i]
+        if (oid == excludeId) continue
+        const info = imageOverlays.get(oid)
+        if (info == null) continue
+        if (map.getLayer(info.layerId) == null) continue
+        for (let j = 0; j < layers.length; j++) {
+            if (layers[j].id == info.layerId && j < lowestIdx) {
+                lowestIdx = j
+                lowestId = info.layerId
+                break
+            }
+        }
+    }
+    return lowestId
+}
+
 // ── 图片覆盖物几何工具（Android/iOS/Web 三端同版纯函数，修改须三端同步） ──
 
 // Web Mercator 正投影：x=经度，y=墨卡托 Y（避免高纬度经纬直接旋转形变）
@@ -1708,12 +1734,18 @@ function addImageOverlayInternal(params: ImageOverlayOptions, replayId: number):
         }
         const z = params.zIndex
         if (z != null && z <= 0) {
-            // 0 档：插到天地图注记层之下（底图之上）；自定义样式无注记层时回退置顶防静默丢层
+            // 0 档：插到天地图注记层之下（底图之上）；自定义样式无注记层时降级到其余图片层最下方
+            //（无其他图片层则置顶，防止静默丢层——与瓦片层回退初衷一致）
             if (map.getLayer('tdt-anno-layer') != null) {
                 map.addLayer(layerDef, 'tdt-anno-layer')
             } else {
-                map.addLayer(layerDef)
-                console.warn('TDTMap Web: 图片覆盖物 zIndex=0 但当前样式无注记层，已按默认置顶处理')
+                const lowestId = lowestImageLayerId(replayId)
+                if (lowestId.length > 0) {
+                    map.addLayer(layerDef, lowestId)
+                } else {
+                    map.addLayer(layerDef)
+                }
+                console.warn('TDTMap Web: 图片覆盖物 zIndex=0 但当前样式无注记层，已按图片层最下处理')
             }
         } else {
             const beforeId = imageOverlayBeforeLayerId(imageOverlayZKey(z), replayId)
@@ -1791,13 +1823,18 @@ export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOption
             const entry = overlayMap.get(id)
             if (entry != null) entry.visible = visible
         }
-        // zIndex 档位变化：moveLayer 重定位（source 不动）
+        // zIndex 档位变化：moveLayer 重定位（source 不动）；无注记层时降级到其余图片层最下方（与 add 分支一致）
         if (changes.zIndex != null && imageOverlayZKey(p.zIndex ?? null) != imageOverlayZKey(oldZ)
             && map.getLayer(info.layerId) != null) {
             const z = p.zIndex
             if (z != null && z <= 0) {
                 if (map.getLayer('tdt-anno-layer') != null) {
                     map.moveLayer(info.layerId, 'tdt-anno-layer')
+                } else {
+                    const lowestId = lowestImageLayerId(id)
+                    if (lowestId.length > 0) {
+                        map.moveLayer(info.layerId, lowestId)
+                    }
                 }
             } else {
                 const beforeId = imageOverlayBeforeLayerId(imageOverlayZKey(z), id)
