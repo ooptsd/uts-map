@@ -16,7 +16,12 @@ import { LatLngBounds } from "org.maplibre.android.geometry"
 import { MarkerOptions, Marker } from "org.maplibre.android.annotations"
 import { PolygonOptions, Polygon } from "org.maplibre.android.annotations"
 import { PolylineOptions, Polyline } from "org.maplibre.android.annotations"
-import { Color } from "android.graphics"
+import { Color, BitmapFactory, Bitmap } from "android.graphics"
+// v1.9.0: 图片覆盖物（ImageSource+RasterLayer / 本机路径两段解码）
+import { ImageSource } from "org.maplibre.android.style.sources"
+import { LatLngQuad } from "org.maplibre.android.geometry"
+import { URL } from "java.net"
+import { UTSAndroid } from "io.dcloud.uts"
 // v1.3.0: 定位、瓦片图层
 import { LocationManager, Location } from "android.location"
 import { PackageManager } from "android.content.pm"
@@ -29,7 +34,8 @@ import {
     MapClickCallback, MapReadyCallback, MapErrorCallback, MarkerClickCallback, GeocodeCallback, SearchOptions,
     MapLongClickCallback, CameraChangeCallback,
     ClusterOptions, HeatmapItem, HeatmapOptions,
-    TileLayerOptions
+    TileLayerOptions,
+    ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickCallback
 } from '../interface.uts'
 
 // ⚠️ 天地图 Key 类型说明（自新系统升级后严格区分，混用会导致瓦片不显示）:
@@ -63,10 +69,21 @@ let overlayMap = new Map<number, OverlayEntry>()
 
 type OverlayEntry = {
     id: number
-    type: string  // 'marker' | 'polygon' | 'polyline' | 'circle' | 'rectangle' | 'label'
-    nativeRef: any  // Marker | Polygon | Polyline
+    type: string  // 'marker' | 'polygon' | 'polyline' | 'circle' | 'rectangle' | 'label' | 'image'
+    nativeRef: any  // Marker | Polygon | Polyline | {source, layer}（image 为 source+layer 包装）
     isVisible: boolean
 }
+
+// ── v1.9.0: 图片覆盖物状态 ──
+// nativeRef 在 overlayMap 中为 {source, layer} 包装（对齐 iOS 形状类先例）；
+// imageOverlayExt 额外持有 params 快照（update 合并/样式重建重放）与 bitmap（本机路径解码复用）
+type ImageOverlayExt = { source: any, layer: any, params: ImageOverlayOptions, bitmap: any | null }
+let imageOverlayExt = new Map<number, ImageOverlayExt>()
+// 平行数组存添加顺序（zIndex 定位/重建重放，UTS Map 迭代限制规避，v1.8.0 同款）
+let imageOverlayIds: Array<number> = []
+let imageOverlayClickCallback: ImageOverlayClickCallback | null = null
+// 大图钳制上限（GPU 纹理安全边界，两段解码 inSampleSize 下采样目标）
+const IMAGE_OVERLAY_MAX_DIM: number = 4096
 
 let markerClickCallback: MarkerClickCallback | null = null
 let mapLongClickCallback: MapLongClickCallback | null = null
@@ -290,6 +307,33 @@ export function initMap(
                             return true  // 事件由标记点击消费，不再触发 mapClick
                         }
                     }
+                }
+            }
+            // v1.9.0: Priority 1.5: 图片覆盖物几何命中检测（不用 queryRenderedFeatures——raster 图层无要素；
+            // 档位高者优先，同档后添加优先），命中即消费事件不触发 mapClick，与 Web/iOS 三端同版算法
+            const imgCb = imageOverlayClickCallback
+            if (imgCb != null && imageOverlayIds.length > 0) {
+                let hitId = 0
+                let hitKey = -2000000
+                let hitIdx = -1
+                for (let i = 0; i < imageOverlayIds.length; i++) {
+                    const oid = imageOverlayIds[i]
+                    const entryImg = overlayMap.get(oid)
+                    const extImg = imageOverlayExt.get(oid)
+                    if (entryImg == null || extImg == null) continue
+                    if (!entryImg.isVisible) continue
+                    if (extImg.params.clickable == false) continue
+                    if (!hitTestImageOverlay(point.latitude, point.longitude, extImg.params)) continue
+                    const key = imageOverlayZKey(extImg.params.zIndex ?? null)
+                    if (key > hitKey || (key == hitKey && i > hitIdx)) {
+                        hitId = oid
+                        hitKey = key
+                        hitIdx = i
+                    }
+                }
+                if (hitId > 0) {
+                    imgCb({ id: hitId, lat: point.latitude, lng: point.longitude })
+                    return true  // 图片点击消费事件，不触发 mapClick
                 }
             }
             // Priority 2: 普通地图点击（仅当未命中标记时）
@@ -685,6 +729,8 @@ export function setMarkers(markers: Array<MapClickDetail>): Array<number> {
 export function clearOverlays(): void {
     clearMarkers()
     clearPolygons()
+    // v1.9.0: 清除图片覆盖物（style 层系，须逐个 removeLayer/removeSource；mapLibreMap 为空时仅清状态）
+    clearImageOverlaysInternal()
     const m = mapLibreMap
     if (m == null) {
         clearOverlayType('polyline')
@@ -802,6 +848,10 @@ export function destroyMap(): void {
     // v1.8.0: 清理图层重建状态（聚合/热力快照已由上方 removeMarkerCluster/removeHeatmap 清空）
     customTileLayerIds = []
     customStyleActive = false
+    // v1.9.0: 图片覆盖物状态（bitmap 引用一并释放，交由 GC 回收）
+    imageOverlayExt = new Map<number, ImageOverlayExt>()
+    imageOverlayIds = []
+    imageOverlayClickCallback = null
 }
 
 // ==================== 缩放控制 ====================
@@ -1017,6 +1067,9 @@ export function removeOverlay(id: number): void {
     const m = mapLibreMap
     if (m == null || ref == null) {
         overlayMap.delete(id)
+        // v1.9.0: 图片覆盖物加载中即被移除——同步清理扩展状态（解码回调将因 entry 缺失而丢弃）
+        imageOverlayExt.delete(id)
+        imageOverlayIds = imageOverlayIds.filter(x => x != id)
         return
     }
     try {
@@ -1035,11 +1088,21 @@ export function removeOverlay(id: number): void {
         } else if (entry.type == 'polyline') {
             m.removePolyline(ref as Polyline)
             polylineList = polylineList.filter(p => p !== ref)
+        } else if (entry.type == 'image') {
+            // v1.9.0: 图片覆盖物为 style 层系（source+layer），非 annotation 体系
+            const style = m.getStyle()
+            if (style != null) {
+                style.removeLayer(ref.layer as RasterLayer)
+                style.removeSource(ref.source as ImageSource)
+            }
         }
     } catch (e: any) {
         console.error("TDTMap: removeOverlay 失败: " + e.message)
     }
     overlayMap.delete(id)
+    // v1.9.0: 图片覆盖物状态同步清理（非图片 ID 时为无害 no-op）
+    imageOverlayExt.delete(id)
+    imageOverlayIds = imageOverlayIds.filter(x => x != id)
 }
 
 // context7 + Exa 验证（maplibre-android-sdk 11.8.1 源码/官方 API 文档）：
@@ -1076,6 +1139,11 @@ export function showOverlay(id: number): void {
                 }
             } else if (entry.type == 'polyline') {
                 (ref as Polyline).setAlpha(1.0.toFloat())
+            } else if (entry.type == 'image') {
+                // v1.9.0: RasterLayer 无 setAlpha，须用 Layer.setVisible（必须显式拦截，否则落入末尾 Polygon 分支）
+                (ref.layer as RasterLayer).setVisible(true)
+                const extShow = imageOverlayExt.get(id)
+                if (extShow != null) extShow.params.visible = true
             } else {
                 (ref as Polygon).setAlpha(1.0.toFloat())
             }
@@ -1102,6 +1170,11 @@ export function hideOverlay(id: number): void {
                 }
             } else if (entry.type == 'polyline') {
                 (ref as Polyline).setAlpha(0.0.toFloat())
+            } else if (entry.type == 'image') {
+                // v1.9.0: RasterLayer 无 setAlpha，须用 Layer.setVisible（必须显式拦截，否则落入末尾 Polygon 分支）
+                (ref.layer as RasterLayer).setVisible(false)
+                const extHide = imageOverlayExt.get(id)
+                if (extHide != null) extHide.params.visible = false
             } else {
                 (ref as Polygon).setAlpha(0.0.toFloat())
             }
@@ -1661,6 +1734,365 @@ export function hideMarkerInfo(id: number): void {
     }
 }
 
+// ════════════════════════════════════════════
+// v1.9.0 新增：图片覆盖物（ImageOverlay）
+// ImageSource+RasterLayer（style 层系）｜URL 直载 / 本机路径 io 线程两段解码｜几何 hit-test 点击
+// ════════════════════════════════════════════
+
+// ── 图片覆盖物几何工具（Android/iOS/Web 三端同版纯函数，修改须三端同步；POC 浏览器实测验证） ──
+
+// zIndex 档位键：未定义=置顶组(1e6) / 正整数=按值排序 / 0 及以下=贴底组(-1)（对齐 TileLayerOptions 三档约定）
+function imageOverlayZKey(z: number | null): number {
+    if (z == null) return 1000000
+    if (z <= 0) return -1
+    return z
+}
+
+// Web Mercator 正投影：x=经度，y=墨卡托 Y（避免高纬度经纬直接旋转形变）
+function mercatorY(lat: number): number {
+    const rad = lat * Math.PI / 180.0
+    return Math.log(Math.tan(Math.PI / 4.0 + rad / 2.0))
+}
+function inverseMercatorY(y: number): number {
+    return (2.0 * Math.atan(Math.exp(y)) - Math.PI / 2.0) * 180.0 / Math.PI
+}
+
+// 计算图片四角坐标（官方顺序：左上/右上/右下/左下，[lng,lat] 对）；bearing≠0 时在 Mercator 平面绕中心顺时针旋转
+function computeImageQuad(sw: MapClickDetail, ne: MapClickDetail, bearing: number): Array<Array<number>> {
+    const corners: Array<Array<number>> = [
+        [sw.lng, ne.lat],
+        [ne.lng, ne.lat],
+        [ne.lng, sw.lat],
+        [sw.lng, sw.lat]
+    ]
+    if (bearing == 0) return corners
+    const rad = -bearing * Math.PI / 180.0
+    const cx = (sw.lng + ne.lng) / 2.0
+    const cyM = (mercatorY(sw.lat) + mercatorY(ne.lat)) / 2.0
+    const out: Array<Array<number>> = []
+    for (let i = 0; i < 4; i++) {
+        const x = corners[i][0] - cx
+        const y = mercatorY(corners[i][1]) - cyM
+        const rx = x * Math.cos(rad) - y * Math.sin(rad)
+        const ry = x * Math.sin(rad) + y * Math.cos(rad)
+        out.push([cx + rx, inverseMercatorY(cyM + ry)])
+    }
+    return out
+}
+
+// 点击命中检测：点击点正向旋转回未旋转 bounds 坐标系后与轴对齐半宽半高比较（与 computeImageQuad 互逆）
+function hitTestImageOverlay(lat: number, lng: number, params: ImageOverlayOptions): boolean {
+    const sw = params.southwest
+    const ne = params.northeast
+    const bearing = params.bearing ?? 0
+    if (bearing == 0) {
+        return lat >= sw.lat && lat <= ne.lat && lng >= sw.lng && lng <= ne.lng
+    }
+    const rad = bearing * Math.PI / 180.0
+    const cx = (sw.lng + ne.lng) / 2.0
+    const cyM = (mercatorY(sw.lat) + mercatorY(ne.lat)) / 2.0
+    const x = lng - cx
+    const y = mercatorY(lat) - cyM
+    const rx = x * Math.cos(rad) - y * Math.sin(rad)
+    const ry = x * Math.sin(rad) + y * Math.cos(rad)
+    const halfW = (ne.lng - sw.lng) / 2.0
+    const halfH = (mercatorY(ne.lat) - mercatorY(sw.lat)) / 2.0
+    return Math.abs(rx) <= halfW && Math.abs(ry) <= halfH
+}
+
+// 四角数组 → MapLibre LatLngQuad（构造参数为 4 个 LatLng，顺序同 GL JS image source：nw/ne/se/sw。
+// 编译期验证项：LatLngQuad(LatLng...) vararg 在 UTS→Kotlin 下 4 参调用；若编译失败改 arrayOf 传参）
+function buildLatLngQuad(quad: Array<Array<number>>): LatLngQuad {
+    return new LatLngQuad(
+        new LatLng(quad[0][1], quad[0][0]),
+        new LatLng(quad[1][1], quad[1][0]),
+        new LatLng(quad[2][1], quad[2][0]),
+        new LatLng(quad[3][1], quad[3][0])
+    )
+}
+
+// 两段解码：先 inJustDecodeBounds 取尺寸，最长边超限时 inSampleSize 下采样（防大图 OOM；
+// 官方算法：https://developer.android.com/topic/performance/graphics/load-bitmap）
+function decodeSampledBitmapFromFile(path: string, maxDim: number): any | null {
+    try {
+        const bounds = new BitmapFactory.Options()
+        bounds.inJustDecodeBounds = true
+        BitmapFactory.decodeFile(path, bounds)
+        let sample = 1
+        let w = bounds.outWidth * 1.0
+        let h = bounds.outHeight * 1.0
+        while (h / (2.0 * sample) >= maxDim || w / (2.0 * sample) >= maxDim) {
+            sample = sample * 2
+        }
+        const opts = new BitmapFactory.Options()
+        opts.inSampleSize = sample
+        return BitmapFactory.decodeFile(path, opts)
+    } catch (e: any) {
+        console.error("TDTMap: 图片解码失败: " + e.message)
+        return null
+    }
+}
+
+// 在现有图片层中找渲染序在 newKey 之上的第一个层（beforeId 语义）；空串表示追加置顶。
+// Android Style.getLayers() 返回 java List，需 Array.fromNative 转换（与 queryRenderedFeatures 同坑）
+function imageOverlayBeforeLayerIdAndroid(style: Style, newKey: number, excludeId: number): string {
+    const layersRaw = style.getLayers()
+    if (layersRaw == null) return ''
+    const layers = Array.fromNative(layersRaw)
+    for (let j = 0; j < layers.length; j++) {
+        const lid = (layers[j] as any).getId() as string
+        for (let i = 0; i < imageOverlayIds.length; i++) {
+            const oid = imageOverlayIds[i]
+            if (oid == excludeId) continue
+            const info = imageOverlayExt.get(oid)
+            if (info == null) continue
+            if (info.layer.getId() == lid) {
+                if (imageOverlayZKey(info.params.zIndex ?? null) > newKey) return lid
+                break
+            }
+        }
+    }
+    return ''
+}
+
+// 返回渲染序最靠前（最下方）的其他图片层 layerId；空串表示无（zIndex=0 无注记层时的降级锚点，与 Web 端一致）
+function lowestImageLayerIdAndroid(style: Style, excludeId: number): string {
+    const layersRaw = style.getLayers()
+    if (layersRaw == null) return ''
+    const layers = Array.fromNative(layersRaw)
+    for (let j = 0; j < layers.length; j++) {
+        const lid = (layers[j] as any).getId() as string
+        for (let i = 0; i < imageOverlayIds.length; i++) {
+            const oid = imageOverlayIds[i]
+            if (oid == excludeId) continue
+            const info = imageOverlayExt.get(oid)
+            if (info == null) continue
+            if (info.layer.getId() == lid) return lid
+        }
+    }
+    return ''
+}
+
+// zIndex 三档插入：0 及以下=注记层之下（缺失降级图片层最下）/ 未定义=置顶 / 正整数=按档位插入
+function placeImageLayerByZIndex(style: Style, layer: RasterLayer, z: number | null, excludeId: number): void {
+    if (z != null && z <= 0) {
+        if (style.getLayer("tdt-label-layer") != null) {
+            style.addLayerBelow(layer, "tdt-label-layer")
+        } else {
+            const lowestId = lowestImageLayerIdAndroid(style, excludeId)
+            if (lowestId.length > 0) {
+                style.addLayerBelow(layer, lowestId)
+            } else {
+                style.addLayer(layer)
+            }
+            console.warn("TDTMap: 图片覆盖物 zIndex=0 但当前样式无注记层，已按图片层最下处理")
+        }
+        return
+    }
+    const beforeId = imageOverlayBeforeLayerIdAndroid(style, imageOverlayZKey(z), excludeId)
+    if (beforeId.length > 0) {
+        style.addLayerBelow(layer, beforeId)
+    } else {
+        style.addLayer(layer)
+    }
+}
+
+// 创建 source+layer 挂载到 style 并回填状态；bitmap=null 且为 http(s) 时由 MapLibre 内部异步加载（不自行下载）
+// 挂载前置条件：overlayMap 已有该 ID 的 entry（预分配或重放时重建）；失败由调用方上报
+function attachImageOverlayToStyle(id: number, params: ImageOverlayOptions, style: Style, bitmap: any | null): boolean {
+    const sourceId = "img-overlay-src-" + id
+    const layerId = "img-overlay-layer-" + id
+    const quad = buildLatLngQuad(computeImageQuad(params.southwest, params.northeast, params.bearing ?? 0))
+    let source: ImageSource
+    if (bitmap != null) {
+        source = new ImageSource(sourceId, quad, bitmap as Bitmap)
+    } else {
+        // URL 直载：new URL(String) 对非法地址抛 MalformedURLException，由外层调用方 catch 上报
+        source = new ImageSource(sourceId, quad, new URL(params.image))
+    }
+    style.addSource(source)
+    const layer = new RasterLayer(layerId, sourceId)
+    layer.setProperties(PropertyFactory.rasterOpacity((1.0 - (params.transparency ?? 0)).toFloat()))
+    const visible = params.visible ?? true
+    if (!visible) {
+        layer.setVisible(false)
+    }
+    placeImageLayerByZIndex(style, layer, params.zIndex, id)
+    imageOverlayExt.set(id, { source: source, layer: layer, params: params, bitmap: bitmap })
+    const entry = overlayMap.get(id)
+    if (entry != null) {
+        entry.nativeRef = { source: source, layer: layer }
+        entry.isVisible = visible
+    }
+    if (imageOverlayIds.indexOf(id) < 0) {
+        imageOverlayIds.push(id)
+    }
+    return true
+}
+
+// 本机路径解码管线：io 线程两段解码 → 主线程回填（UTSAndroid.getDispatcher 官方线程调度，
+// uts-for-android.md §2.4）。updateMode=true 时仅 setBitmap 换图不重建图层。
+// 竞态防护：回调时校验 entry 仍在 overlayMap（clear/destroy/remove 后丢弃）
+function decodeLocalBitmapForOverlay(id: number, params: ImageOverlayOptions, updateMode: boolean): void {
+    UTSAndroid.getDispatcher("io").async(function(_: any) {
+        const bmp = decodeSampledBitmapFromFile(params.image, IMAGE_OVERLAY_MAX_DIM)
+        UTSAndroid.getDispatcher("main").async(function(_: any) {
+            const entry = overlayMap.get(id)
+            if (entry == null) {
+                if (bmp != null) (bmp as Bitmap).recycle()
+                return
+            }
+            if (bmp == null) {
+                const errCb = onErrorCallback
+                if (errCb != null) {
+                    errCb({ code: 4, message: "图片解码失败（路径不存在或非图片）: " + params.image })
+                }
+                if (!updateMode) overlayMap.delete(id)
+                return
+            }
+            if (updateMode) {
+                const ext = imageOverlayExt.get(id)
+                if (ext != null && entry.nativeRef != null) {
+                    (entry.nativeRef.source as ImageSource).setBitmap(bmp as Bitmap)
+                    ext.bitmap = bmp
+                } else {
+                    (bmp as Bitmap).recycle()
+                }
+                return
+            }
+            const m = mapLibreMap
+            const style = m?.getStyle()
+            if (style == null) {
+                const errCb2 = onErrorCallback
+                if (errCb2 != null) {
+                    errCb2({ code: 4, message: "样式未加载，无法添加图片覆盖物" })
+                }
+                overlayMap.delete(id)
+                (bmp as Bitmap).recycle()
+                return
+            }
+            attachImageOverlayToStyle(id, params, style, bmp)
+        }, null)
+    }, null)
+}
+
+// v1.9.0: 清除全部图片覆盖物（供 clearOverlays/样式重建调用；style 为空时仅清状态）
+function clearImageOverlaysInternal(): void {
+    const style = mapLibreMap?.getStyle()
+    for (let i = 0; i < imageOverlayIds.length; i++) {
+        const id = imageOverlayIds[i]
+        const ext = imageOverlayExt.get(id)
+        if (ext != null && style != null) {
+            try {
+                style.removeLayer(ext.layer as RasterLayer)
+                style.removeSource(ext.source as ImageSource)
+            } catch (e: any) {
+                console.error("TDTMap: clearImageOverlays 移除失败: " + e.message)
+            }
+        }
+        overlayMap.delete(id)
+        imageOverlayExt.delete(id)
+    }
+    imageOverlayIds = []
+}
+
+export function addImageOverlay(params: ImageOverlayOptions): number {
+    const m = mapLibreMap
+    const style = m?.getStyle()
+    if (style == null) {
+        const errCb = onErrorCallback
+        if (errCb != null) {
+            errCb({ code: 4, message: "样式未加载，无法添加图片覆盖物" })
+        }
+        return 0
+    }
+    // 预分配 ID（本机路径场景 nativeRef 先置空，解码完成后回填——对齐鸿蒙 addMarker 先例）
+    const id = allocateOverlayId('image', null)
+    const isHttp = params.image.indexOf("http://") == 0 || params.image.indexOf("https://") == 0
+    try {
+        if (isHttp) {
+            attachImageOverlayToStyle(id, params, style, null)
+        } else {
+            // 本机路径：io 线程解码，回调时校验 entry 仍在（remove/clear 竞态防护）
+            decodeLocalBitmapForOverlay(id, params, false)
+        }
+    } catch (e: any) {
+        console.error("TDTMap: addImageOverlay 失败: " + e.message)
+        overlayMap.delete(id)
+        const errCb2 = onErrorCallback
+        if (errCb2 != null) {
+            errCb2({ code: 2, message: "添加图片覆盖物失败: " + e.message })
+        }
+        return 0
+    }
+    return id
+}
+
+export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOptions): void {
+    const entry = overlayMap.get(id)
+    const ext = imageOverlayExt.get(id)
+    const m = mapLibreMap
+    if (entry == null || ext == null || m == null) return
+    if (entry.nativeRef == null) {
+        console.warn("TDTMap: updateImageOverlay - 图片加载中，本次更新已忽略")
+        return
+    }
+    const p = ext.params
+    const oldZ = p.zIndex ?? null
+    // 合并变更（未传字段保持不变）
+    if (changes.southwest != null) p.southwest = changes.southwest
+    if (changes.northeast != null) p.northeast = changes.northeast
+    if (changes.image != null) p.image = changes.image
+    if (changes.transparency != null) p.transparency = changes.transparency
+    if (changes.zIndex != null) p.zIndex = changes.zIndex
+    if (changes.bearing != null) p.bearing = changes.bearing
+    if (changes.visible != null) p.visible = changes.visible
+    if (changes.clickable != null) p.clickable = changes.clickable
+    try {
+        const src = entry.nativeRef.source as ImageSource
+        const layer = entry.nativeRef.layer as RasterLayer
+        // 范围/旋转变化：setCoordinates 官方 API；换图：URL 直设或本机路径重新解码后 setBitmap
+        if (changes.southwest != null || changes.northeast != null || changes.bearing != null || changes.image != null) {
+            if (changes.image != null
+                && !(p.image.indexOf("http://") == 0 || p.image.indexOf("https://") == 0)) {
+                decodeLocalBitmapForOverlay(id, p, true)
+            } else {
+                src.setCoordinates(buildLatLngQuad(computeImageQuad(p.southwest, p.northeast, p.bearing ?? 0)))
+                if (changes.image != null) {
+                    src.setUrl(new URL(p.image))
+                }
+            }
+        }
+        if (changes.transparency != null) {
+            layer.setProperties(PropertyFactory.rasterOpacity((1.0 - (p.transparency ?? 0)).toFloat()))
+        }
+        if (changes.visible != null) {
+            const visible = p.visible != false
+            layer.setVisible(visible)
+            entry.isVisible = visible
+        }
+        // zIndex 档位变化：Android Style 无 moveLayer，removeLayer 后按新档位重插（同一 layer 对象可复用）
+        if (changes.zIndex != null && imageOverlayZKey(p.zIndex ?? null) != imageOverlayZKey(oldZ)) {
+            const style = m.getStyle()
+            if (style != null) {
+                try { style.removeLayer(layer) } catch (e3: any) { /* 新样式无该层时容忍 */ }
+                placeImageLayerByZIndex(style, layer, p.zIndex, id)
+            }
+        }
+    } catch (e: any) {
+        console.error("TDTMap: updateImageOverlay 失败: " + e.message)
+        const errCb = onErrorCallback
+        if (errCb != null) {
+            errCb({ code: 4, message: "更新图片覆盖物失败: " + e.message })
+        }
+    }
+}
+
+export function setImageOverlayClickCallback(callback: ImageOverlayClickCallback | null): void {
+    // 仅更新回调引用；命中检测在 initMap 注册的单一 OnMapClickListener Priority 链内执行（不重复注册监听器）
+    imageOverlayClickCallback = callback
+}
+
 // ══════════════════════════════════════════════
 // v1.3.0 新增：自定义瓦片图层
 // ══════════════════════════════════════════════
@@ -1796,6 +2228,41 @@ function rebuildUserLayersAfterStyle(): void {
         heatmapDataRef = null
         heatmapOptionsRef = null
         addHeatmap(pts, opts)
+    }
+    // v1.9.0: 图片覆盖物重放（本机解码的复用持有位图不重新解码；URL 的交给 MapLibre 内部重新加载）
+    if (imageOverlayIds.length > 0) {
+        const savedImgs: Array<any> = []
+        for (let i = 0; i < imageOverlayIds.length; i++) {
+            const oid = imageOverlayIds[i]
+            const ext = imageOverlayExt.get(oid)
+            const entry0 = overlayMap.get(oid)
+            if (ext != null) {
+                savedImgs.push({ id: oid, params: ext.params, bitmap: ext.bitmap, visible: entry0 != null ? entry0.isVisible : true })
+            }
+        }
+        imageOverlayExt.clear()
+        imageOverlayIds = []
+        const st2 = mapLibreMap?.getStyle()
+        if (st2 != null) {
+            for (let i = 0; i < savedImgs.length; i++) {
+                const oid = savedImgs[i].id as number
+                // 重建 entry（保持原 ID 与添加顺序；nativeRef 由 attach 回填）
+                overlayMap.set(oid, { id: oid, type: 'image', nativeRef: null, isVisible: true })
+                try {
+                    attachImageOverlayToStyle(oid, savedImgs[i].params as ImageOverlayOptions, st2, savedImgs[i].bitmap)
+                    // 恢复重建前的可见性（hide 过的不能因重建而复现）
+                    const snapVisible = savedImgs[i].visible as boolean
+                    const entry2 = overlayMap.get(oid)
+                    if (!snapVisible && entry2 != null && entry2.nativeRef != null) {
+                        (entry2.nativeRef.layer as RasterLayer).setVisible(false)
+                        entry2.isVisible = false
+                    }
+                } catch (e: any) {
+                    console.error("TDTMap: 图片覆盖物重建失败 id=" + oid + ": " + e.message)
+                    overlayMap.delete(oid)
+                }
+            }
+        }
     }
 }
 
