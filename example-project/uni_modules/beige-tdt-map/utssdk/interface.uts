@@ -236,3 +236,55 @@ export declare function addWMSTileLayer(id: string, wmsUrl: string, layers: stri
 
 // 当前平台是否支持 canvas 标注（Web=true；Android/iOS/鸿蒙=false）
 export declare function isSupportCanvas(): boolean
+
+// ═══════════════════════════════════════════════════════════
+// v1.9.0 新增：图片覆盖物（ImageOverlay）
+// ═══════════════════════════════════════════════════════════
+
+// 图片覆盖物参数（对齐鸿蒙 mapCommon.ImageOverlayParams）
+// image：http(s) 远程图片 URL 或本机缓存文件绝对路径（缓存由调用方维护，插件仅按地址加载）
+// ⚠️ Web 端仅支持 http(s)/data: URL（浏览器无法读本机路径），传本机路径上报 code=4
+// transparency：0~1 透明度，0=不透明（默认），1=全透明（MapLibre 端换算 raster-opacity=1-transparency）
+// zIndex：0=插到注记层之下 / 缺省=置顶 / 正整数=图片覆盖物之间按值排序
+//   （仅图片层内部相对层序，不改变与 marker 的相对关系；对齐 TileLayerOptions.zIndex 三档约定）
+// bearing：0~360 顺时针旋转，绕 bounds 中心（MapLibre 端通过四角坐标在 Web Mercator 平面旋转等效实现）
+// anchorU/anchorV（鸿蒙特有，默认 0.5/0.5）不纳入跨端 API：MapLibre 图片恒铺满四角范围，无锚点语义
+export type ImageOverlayOptions = {
+    southwest: MapClickDetail
+    northeast: MapClickDetail
+    image: string
+    transparency?: number
+    zIndex?: number
+    bearing?: number
+    visible?: boolean
+    clickable?: boolean
+}
+
+// 运行时更新（全可选，未传字段保持不变）
+export type ImageOverlayUpdateOptions = {
+    southwest?: MapClickDetail
+    northeast?: MapClickDetail
+    image?: string
+    transparency?: number
+    zIndex?: number
+    bearing?: number
+    visible?: boolean
+    clickable?: boolean
+}
+
+// 点击详情：MapLibre 三端 lat/lng=实际点击点；鸿蒙=覆盖物 bounds 中心
+export type ImageOverlayClickDetail = {
+    id: number
+    lat: number
+    lng: number
+}
+export type ImageOverlayClickCallback = (detail: ImageOverlayClickDetail) => void
+
+// 添加图片覆盖物：图片拉伸填满 bounds（bearing≠0 时绕中心旋转）；立即返回 overlay ID（图片异步加载，
+// 失败时 onError 上报 code=2（网络）/code=4（解码或参数非法）且该 ID 失效）；
+// 立即校验失败（如 Web 传本机路径）返回 0。与 removeOverlay/showOverlay/hideOverlay/clearOverlays 统一管理
+export declare function addImageOverlay(params: ImageOverlayOptions): number
+// 运行时更新指定 ID 的图片覆盖物（ID 不变；更新项未传字段保持不变）
+export declare function updateImageOverlay(id: number, changes: ImageOverlayUpdateOptions): void
+// 点击回调（clickable=true 且可见时触发，互斥消费 mapClick；对齐 setMarkerClickCallback 模式）
+export declare function setImageOverlayClickCallback(callback: ImageOverlayClickCallback | null): void
