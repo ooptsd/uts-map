@@ -14,6 +14,7 @@
       @markertap="onMarkerTap"
       @mapLongClick="onMapLongClick"
       @cameraChange="onCameraChange"
+      @imageOverlayClick="onImageOverlayClick"
     />
 
     <!-- 控制面板 -->
@@ -143,6 +144,33 @@
         </view>
         <text v-if="infoText.length > 0" class="result-text">{{ infoText }}</text>
 
+        <text class="section-title">📊 数据可视化（v1.7.0 新增）</text>
+        <view class="btn-row">
+          <button class="btn" @tap="demoCluster">300点聚合</button>
+          <button class="btn" @tap="clearCluster">清除聚合</button>
+          <button class="btn" @tap="demoHeatmap">热力图</button>
+          <button class="btn" @tap="clearHeatmap">清除热力</button>
+        </view>
+
+        <text class="section-title">🎨 图层增强（v1.8.0 新增）</text>
+        <view class="btn-row">
+          <button class="btn" @tap="demoSetStyle">setStyle</button>
+          <button class="btn" @tap="demoRemoveStyle">removeStyle</button>
+          <button class="btn" @tap="demoWms">WMS 叠加</button>
+          <button class="btn" @tap="demoCanvas">canvas 探测</button>
+          <button class="btn" @tap="demoClearBounds">清除边界</button>
+        </view>
+
+        <text class="section-title">🖼️ 图片覆盖物（v1.9.0 新增）</text>
+        <view class="btn-row">
+          <button class="btn" @tap="demoAddImage">添加网络图</button>
+          <button class="btn" @tap="demoImageTransparency">半透明</button>
+          <button class="btn" @tap="demoImageBearing">旋转45°</button>
+          <button class="btn" @tap="demoImageSwap">换图</button>
+          <button class="btn" @tap="demoImageUpdateBounds">移位回正</button>
+          <button class="btn btn-danger" @tap="demoRemoveImage">移除</button>
+        </view>
+
         <text class="section-title">🗺️ 地图事件日志</text>
         <text v-if="clickLog.length > 0" class="result-text">{{ clickLog }}</text>
       </scroll-view>
@@ -152,7 +180,7 @@
 
 <script setup lang="uts">
 import { ref } from 'vue'
-import type { MapClickDetail, MapErrorDetail, MapBoundsDetail, GeocodeCallback, SearchOptions } from '@/uni_modules/beige-tdt-map'
+import type { MapClickDetail, MapErrorDetail, MapBoundsDetail, GeocodeCallback, SearchOptions, ClusterOptions, HeatmapItem, ImageOverlayClickDetail } from '@/uni_modules/beige-tdt-map'
 
 const mapRef = ref(null as any | null)
 const coordResult = ref('')
@@ -182,6 +210,8 @@ function onMarkerTap(detail: MapClickDetail): void {
 
 function onMapError(err: MapErrorDetail): void {
   console.error('TDTMap Demo: 错误 [' + err.code + ']', err.message)
+  // v1.8.0: 平台不支持（code=5）回显到面板，避免"已叠加"等成功文案误导
+  if (err.code == 5) infoText.value = '当前平台不支持: ' + err.message
 }
 
 // ── v1.4.0 新增：长按事件 ──
@@ -196,6 +226,12 @@ function onMapLongClick(detail: MapClickDetail): void {
 // ── v1.4.0 新增：相机变化事件 ──
 function onCameraChange(detail: MapClickDetail): void {
   clickLog.value = '相机移动: ' + detail.lat.toFixed(6) + ', ' + detail.lng.toFixed(6)
+}
+
+// ── v1.9.0 新增：图片覆盖物点击事件 ──
+function onImageOverlayClick(detail: ImageOverlayClickDetail): void {
+  infoText.value = '图片覆盖物点击 #' + detail.id + ' @ ' + detail.lat.toFixed(4) + ', ' + detail.lng.toFixed(4)
+  console.log('TDTMap Demo: 图片覆盖物点击', detail.id, detail.lat, detail.lng)
 }
 
 // ── 地图类型 ──
@@ -427,23 +463,13 @@ function doSearchNearby(): void {
 // ── v1.3.0 新增：定位 ──
 
 function showUserLoc(): void {
-  // Android/iOS 必须运行时请求定位权限
-  // #ifdef APP-ANDROID || APP-IOS
-  uni.authorize({
-    scope: 'scope.userLocation',
-    success(): void {
-      mapRef.value?.setShowUserLocation(true)
-      infoText.value = '定位蓝点已显示'
-    },
-    fail(): void {
-      infoText.value = '定位权限被拒绝，请在系统设置中手动开启位置权限'
-    }
+  // v1.5.4: uni-app x 无 uni.authorize API；定位权限由原生层 getUserLocation 自动申请（弹系统授权框）
+  mapRef.value?.getCurrentLocation((detail: MapClickDetail) => {
+    mapRef.value?.setShowUserLocation(true)
+    infoText.value = '定位蓝点已显示: ' + detail.lat.toFixed(4) + ', ' + detail.lng.toFixed(4)
+  }, (err: MapErrorDetail) => {
+    infoText.value = '定位失败: ' + err.message
   })
-  // #endif
-  // #ifndef APP-ANDROID || APP-IOS
-  mapRef.value?.setShowUserLocation(true)
-  infoText.value = '定位蓝点已显示（需系统定位权限）'
-  // #endif
 }
 
 function hideUserLoc(): void {
@@ -452,21 +478,8 @@ function hideUserLoc(): void {
 }
 
 function getUserLoc(): void {
-  // Android/iOS 必须运行时请求定位权限
-  // #ifdef APP-ANDROID || APP-IOS
-  uni.authorize({
-    scope: 'scope.userLocation',
-    success(): void {
-      doGetLocation()
-    },
-    fail(): void {
-      infoText.value = '定位权限被拒绝，请在系统设置中手动开启位置权限'
-    }
-  })
-  // #endif
-  // #ifndef APP-ANDROID || APP-IOS
+  // v1.5.4: 原生层已内置权限申请，直接调用即可
   doGetLocation()
-  // #endif
 }
 
 function doGetLocation(): void {
@@ -567,6 +580,86 @@ function showCenter(): void {
   if (c != null) infoText.value = '中心: ' + c.lat.toFixed(4) + ', ' + c.lng.toFixed(4)
 }
 
+// ── 数据可视化 v1.7.0 ──
+
+function demoCluster(): void {
+  // 演示点在上海外滩附近，先把视野移过去再添加，否则点落在初始北京视野之外
+  mapRef.value?.moveToCenter(31.2304, 121.4737)
+  mapRef.value?.zoomTo(13)
+  const pts: Array<MapClickDetail> = []
+  for (let i = 0; i < 300; i++) {
+    pts.push({
+      lat: 31.2304 + (Math.random() - 0.5) * 0.5,
+      lng: 121.4737 + (Math.random() - 0.5) * 0.5
+    })
+  }
+  const opts: ClusterOptions = { clusterRadius: 50, clusterMaxZoom: 14 }
+  mapRef.value?.addMarkerCluster(pts, opts)
+  infoText.value = '已添加 300 个聚合点（点击聚合簇自动放大）'
+}
+
+function clearCluster(): void {
+  mapRef.value?.removeMarkerCluster()
+  infoText.value = '聚合层已清除'
+}
+
+function demoHeatmap(): void {
+  // 同上：先把视野移到热力点分布区
+  mapRef.value?.moveToCenter(31.2304, 121.4737)
+  mapRef.value?.zoomTo(13)
+  const pts: Array<HeatmapItem> = []
+  for (let i = 0; i < 500; i++) {
+    pts.push({
+      lat: 31.2304 + (Math.random() - 0.5) * 0.4,
+      lng: 121.4737 + (Math.random() - 0.5) * 0.4,
+      weight: Math.floor(Math.random() * 10) + 1
+    })
+  }
+  mapRef.value?.addHeatmap(pts, { radius: 30, opacity: 0.6 })
+  infoText.value = '已添加 500 点热力图'
+}
+
+function clearHeatmap(): void {
+  mapRef.value?.removeHeatmap()
+  infoText.value = '热力层已清除'
+}
+
+// ── 图层增强 v1.8.0 ──
+
+function demoSetStyle(): void {
+  const custom = JSON.stringify({
+    version: 8,
+    glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+    sources: {
+      osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256 }
+    },
+    layers: [{ id: 'osm-layer', type: 'raster', source: 'osm' }]
+  })
+  mapRef.value?.setStyle(custom)
+  infoText.value = 'setStyle 已调用（OSM 样式）'
+}
+
+function demoRemoveStyle(): void {
+  mapRef.value?.removeStyle()
+  infoText.value = 'removeStyle 已调用（恢复天地图）'
+}
+
+function demoWms(): void {
+  // Terrestris 公共 OSM WMS（无需 Key，EPSG:3857，实测可用）
+  mapRef.value?.addWMSTileLayer('wms-demo', 'https://ows.terrestris.de/osm/service', 'OSM-WMS', { opacity: 0.8, zIndex: 0 })
+  infoText.value = 'WMS 图层已叠加（opacity=0.8, 贴底）'
+}
+
+function demoCanvas(): void {
+  if (mapRef.value == null) { infoText.value = '地图尚未就绪'; return }
+  infoText.value = 'isSupportCanvas = ' + (mapRef.value.isSupportCanvas() ? 'true' : 'false') + '（当前平台）'
+}
+
+function demoClearBounds(): void {
+  mapRef.value?.setMapMaxBounds(null, null, null, null)
+  infoText.value = '边界限制已清除'
+}
+
 function showZoom(): void {
   const z = mapRef.value?.getCurrentZoom()
   if (z != null) infoText.value = '缩放级别: ' + z
@@ -577,6 +670,68 @@ function showBounds(): void {
   if (b != null) {
     infoText.value = '范围: [' + b.minLat.toFixed(4) + ',' + b.minLng.toFixed(4) + '] → [' + b.maxLat.toFixed(4) + ',' + b.maxLng.toFixed(4) + ']'
   }
+}
+
+// ── 图片覆盖物 v1.9.0 ──
+// 演示图用 Mapbox/MapLibre image source 官方示例素材（CORS 开放）；
+// 国内网络不佳时可替换为任意 http(s) 图片或本机缓存路径（缓存由调用方维护，插件仅按地址加载）
+const DEMO_IMAGE_URL = 'https://docs.mapbox.com/mapbox-gl-js/assets/radar.gif'
+const DEMO_IMAGE_URL_2 = 'https://docs.mapbox.com/mapbox-gl-js/assets/cat.png'
+let lastImageOverlayId: number = 0
+
+function demoAddImage(): void {
+  mapRef.value?.moveToCenter(39.91, 116.40)
+  mapRef.value?.zoomTo(11)
+  const id = mapRef.value?.addImageOverlay({
+    southwest: { lat: 39.88, lng: 116.36 },
+    northeast: { lat: 39.94, lng: 116.44 },
+    image: DEMO_IMAGE_URL,
+    transparency: 0,
+    zIndex: 1,
+    bearing: 0
+  }) ?? 0
+  lastImageOverlayId = id
+  lastOverlayId = id
+  if (id > 0) {
+    infoText.value = '图片覆盖物 #' + id + ' 已添加（点击图片试试）'
+  } else {
+    infoText.value = '添加失败（样式未加载或地址非法；Web 端仅支持 http(s)/data: URL）'
+  }
+}
+
+function demoImageTransparency(): void {
+  if (lastImageOverlayId <= 0) { infoText.value = '请先添加图片覆盖物'; return }
+  mapRef.value?.updateImageOverlay(lastImageOverlayId, { transparency: 0.5 })
+  infoText.value = '透明度已改为 0.5（transparency=0.5 → 显示 50% 透明）'
+}
+
+function demoImageBearing(): void {
+  if (lastImageOverlayId <= 0) { infoText.value = '请先添加图片覆盖物'; return }
+  mapRef.value?.updateImageOverlay(lastImageOverlayId, { bearing: 45 })
+  infoText.value = 'bearing=45°（绕 bounds 中心顺时针旋转）'
+}
+
+function demoImageSwap(): void {
+  if (lastImageOverlayId <= 0) { infoText.value = '请先添加图片覆盖物'; return }
+  mapRef.value?.updateImageOverlay(lastImageOverlayId, { image: DEMO_IMAGE_URL_2 })
+  infoText.value = '已换图（同 ID 重建加载）'
+}
+
+function demoImageUpdateBounds(): void {
+  if (lastImageOverlayId <= 0) { infoText.value = '请先添加图片覆盖物'; return }
+  mapRef.value?.updateImageOverlay(lastImageOverlayId, {
+    southwest: { lat: 39.90, lng: 116.38 },
+    northeast: { lat: 39.93, lng: 116.42 },
+    bearing: 0
+  })
+  infoText.value = '范围已缩小并回正'
+}
+
+function demoRemoveImage(): void {
+  if (lastImageOverlayId <= 0) { infoText.value = '请先添加图片覆盖物'; return }
+  mapRef.value?.removeOverlayById(lastImageOverlayId)
+  infoText.value = '图片覆盖物 #' + lastImageOverlayId + ' 已移除'
+  lastImageOverlayId = 0
 }
 </script>
 
