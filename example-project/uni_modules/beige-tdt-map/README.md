@@ -313,6 +313,42 @@ mapRef.value?.setMapMaxBounds(null, null, null, null)
 > ⚠️ 鸿蒙 `addTileLayer` 的 options 仅 opacity（transparency）生效，minZoom/maxZoom/zIndex 忽略并 warn。
 > `zIndex` 仅支持 `0`（插到底图注记层之下）与缺省（默认置顶），其他值忽略并 warn。
 
+### 🖼️ 图片覆盖物（v1.9.0 新增）
+
+| 方法 | 参数 | 说明 |
+|------|------|------|
+| `addImageOverlay(params)` | `ImageOverlayOptions` | 添加图片覆盖物：图片拉伸填满 bounds（bearing 旋转），返回 overlay ID；与 `removeOverlayById`/`showOverlayById`/`hideOverlayById`/`clearAllOverlays` 统一管理 |
+| `updateImageOverlay(id, changes)` | overlay ID + `ImageOverlayUpdateOptions` | 运行时更新（全可选字段，未传项保持不变；ID 不变） |
+| `@imageOverlayClick` | 事件 | `clickable=true` 且可见时触发，互斥消费 mapClick（四端行为一致；detail 含 id/lat/lng） |
+
+```ts
+const id = mapRef.value?.addImageOverlay({
+  southwest: { lat: 39.88, lng: 116.36 },
+  northeast: { lat: 39.94, lng: 116.44 },
+  image: 'https://example.com/radar.gif',   // http(s) URL 或本机缓存绝对路径（缓存由调用方维护，插件仅按地址加载）
+  transparency: 0.3,   // 0=不透明（默认）~ 1=全透明
+  zIndex: 1,           // 0=注记层下 / 缺省=置顶 / 正整数=图片层之间按值排序
+  bearing: 0,          // 0~360 顺时针，绕 bounds 中心
+  visible: true,
+  clickable: true
+})
+
+// 半透明 + 旋转 45°（ID 不变）
+mapRef.value?.updateImageOverlay(id, { transparency: 0.5, bearing: 45 })
+
+// 移除/显隐复用统一管理体系
+mapRef.value?.removeOverlayById(id)
+```
+
+> ⚠️ 平台差异：
+> - `image` 四端均支持 http(s) URL 与本机缓存文件绝对路径（缓存由调用方维护）；**Web 端仅支持 http(s)/data: URL**（浏览器无法读本机路径），传本机路径上报 code=4 并返回 0
+> - 大图建议最长边 ≤ 4096px：Android/鸿蒙超大图自动下采样（inSampleSize/desiredSize），iOS/Web 由引擎处理，超限可能渲染失败
+> - `zIndex` 为三档语义（对齐瓦片图层约定），仅决定图片覆盖物之间的相对层序，不改变与 marker 的相对关系；鸿蒙原生精确生效
+> - `bearing` 在 MapLibre 三端通过四角坐标在 Web Mercator 平面旋转等效实现；鸿蒙原生参数直通
+> - 鸿蒙特有 `anchorU/anchorV`（默认 0.5/0.5）未纳入跨端 API——MapLibre 图片恒铺满四角范围，无锚点语义
+> - 图片异步加载：ID 立即可用于 remove/show/hide/update（加载中的 update 合并在加载完成后应用）；加载失败经 `mapError` 上报 code=2（网络）/code=4（解码或参数非法）且该 ID 失效
+> - MapLibre 三端 `setStyle` 后图片覆盖物随用户图层自动重建（同 ID 保序）；鸿蒙无 setStyle
+
 ### 覆盖物
 
 | 方法 | 返回值 | 说明 |
@@ -449,11 +485,44 @@ type SearchOptions = {
   count?: string
   specifyAdminCode?: string
 }
+
+// v1.9.0：图片覆盖物
+type ImageOverlayOptions = {
+  southwest: MapClickDetail
+  northeast: MapClickDetail
+  image: string                // http(s) URL 或本机缓存绝对路径（Web 仅 http(s)/data:）
+  transparency?: number        // 0=不透明（默认）~ 1=全透明
+  zIndex?: number              // 0=注记层下 / 缺省=置顶 / 正整数=图片层之间按值排序
+  bearing?: number             // 0~360 顺时针，绕 bounds 中心
+  visible?: boolean            // 默认 true
+  clickable?: boolean          // 默认 true（命中点击时触发 imageOverlayClick 并互斥消费 mapClick）
+}
+type ImageOverlayUpdateOptions = {
+  southwest?: MapClickDetail
+  northeast?: MapClickDetail
+  image?: string
+  transparency?: number
+  zIndex?: number
+  bearing?: number
+  visible?: boolean
+  clickable?: boolean
+}
+type ImageOverlayClickDetail = { id: number; lat: number; lng: number }
 ```
 
 ---
 
 ## 版本历史
+
+### v1.9.0（2026-09）
+
+#### ✨ 新增：图片覆盖物（ImageOverlay）
+
+- 四端统一的图片地理范围覆盖：图片拉伸填满 bounds，bearing 绕中心旋转（MapLibre 三端 Web Mercator 四角等效实现，鸿蒙原生直通）
+- 图片来源：http(s) URL 与本机缓存绝对路径（缓存由调用方维护）；Web 端仅 http(s)/data: URL（本机路径上报 code=4）
+- 大图防护：Android inSampleSize / 鸿蒙 desiredSize 两段解码链制 4096px；iOS/Web 引擎直载
+- 点击互斥：四端 clickable 命中消费 mapClick；MapLibre 三端几何 hit-test（raster 无要素），鸿蒙原生 imageOverlayClick
+- 生命周期：异步加载 ID 立即可管理（加载中 update 合并）、失败上报 code=2/4 且 ID 失效、setStyle 自动重建（MapLibre 三端同 ID）
 
 ### v1.6.0（2026-08-16）
 
@@ -859,7 +928,14 @@ echo file_get_contents($url);
 
 ## 更新日志
 
-### v1.6.0 🎛️（最新）
+### v1.9.0 🖼️（最新）
+
+- ✨ 新增：图片覆盖物 `addImageOverlay` / `updateImageOverlay` / `@imageOverlayClick`——图片按地理范围拉伸贴合，支持 transparency/zIndex 三档/bearing 旋转/visible/clickable，复用 overlay ID 统一管理体系
+- 🌐 四端统一：Android（ImageSource URL 直载 / 本机路径 io 线程两段解码防 OOM）、iOS（MLNImageSource 引擎直载 / 本机 UIImage）、鸿蒙（华为原生 addImageOverlay 全参数 + http 下载转 PixelMap + >4096 下采样）、Web（image source + raster layer）
+- 🖱️ 点击检测：MapLibre 三端统一几何 hit-test（raster 图层无要素），命中互斥消费 mapClick；鸿蒙原生 imageOverlayClick
+- 🔁 setStyle 后图片覆盖物随用户图层自动重建（MapLibre 三端，同 ID 保序）
+
+### v1.6.0 🎛️
 
 - ✨ 新增：缩放按钮 / 比例尺 / 版权条基础控件组（Android/iOS 为 uvue 层，鸿蒙/Web 为原生控件）
 - ✨ 新增 props：`showZoomControl` / `showScaleControl` / `showCopyrightControl` / `copyrightText`

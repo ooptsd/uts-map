@@ -1,5 +1,13 @@
 # beige-tdt-map 更新日志
 
+## 1.9.0（发布时填写日期）
+
+- ✨ 新增：图片覆盖物 `addImageOverlay` / `updateImageOverlay` / `setImageOverlayClickCallback`（组件层 `@imageOverlayClick`）——图片按地理范围拉伸贴合，支持 transparency/zIndex 三档/bearing 旋转/visible/clickable，复用 overlay ID 统一管理体系（removeOverlay/showOverlay/hideOverlay/clearOverlays）
+- 🌐 四端统一：Android（ImageSource URL 直载 / 本机路径 io 线程两段解码防 OOM）、iOS（MLNImageSource 引擎直载 / 本机 UIImage 同步读）、鸿蒙（华为原生 addImageOverlay 全参数直通 + http 下载转 PixelMap + >4096 下采样）、Web（image source + raster layer）
+- 🖱️ 点击检测：MapLibre 三端统一几何 hit-test（raster 图层无要素，不用 queryRenderedFeatures），命中互斥消费 mapClick；鸿蒙原生 imageOverlayClick（getId 反查插件 ID）
+- 🖼️ 图片来源：http(s) URL 与本机缓存绝对路径（缓存由调用方维护）；Web 端仅 http(s)/data: URL，本机路径上报 code=4
+- 🔁 setStyle 后图片覆盖物随用户图层自动重建（MapLibre 三端，同 ID 保序）；异步加载中 update 合并应用、失败上报 code=2/4 且 ID 失效
+
 ## 1.8.0（发布时填写日期）
 
 - ✨ 新增：`setStyle` / `removeStyle`——运行时替换/还原 MapLibre 样式（style spec JSON，须含 version 字段），切换后自动重建用户图层（自定义瓦片/WMS/聚合/热力），天底图由自定义样式自带

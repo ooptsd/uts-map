@@ -13,6 +13,7 @@ uni-app x（蒸汽模式）UTS 原生插件，GPU 渲染的高性能天地图地
 - 🗺️ 三种地图类型：矢量 / 影像 / 地形
 - 📍 标记点、批量标记、气泡（随地图移动跟随）、文字标注
 - 🔷 折线 / 圆 / 矩形 / 多边形覆盖物
+- 🖼️ 图片覆盖物（v1.9.0）：地理范围拉伸贴合、旋转/透明/层序/点击，http(s) 与本机缓存图
 - 🔍 天地图地名搜索（v2 API）、内置搜索框与结果列表
 - 🎯 定位（GPS / 网络双通道）、用户位置蓝点
 - 🎛️ 缩放按钮 / 比例尺 / 版权条（v1.6.0）
@@ -81,7 +82,7 @@ function onMapClick(detail: MapClickDetail) {
 
 ## 🔖 当前版本
 
-**v1.6.0**（2026-08）：新增缩放按钮 / 比例尺 / 版权条基础控件组。历史版本见 [changelog](tmp-publish/beige-tdt-map/changelog.md)。
+**v1.9.0**（2026-09）：新增图片覆盖物（ImageOverlay，四端统一）。历史版本见 [changelog](tmp-publish/beige-tdt-map/changelog.md)。
 
 ## 📄 开源协议
 
