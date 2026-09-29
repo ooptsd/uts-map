@@ -131,10 +131,12 @@ import {
   // v1.9.0: E0 GeoJSON 层重放通知（样式重建后由原生层触发组件层重放）
   setGeoJsonReplayCallback as nativeSetGeoJsonReplayCallback,
   // v1.9.0: E0.3a styled 折线（虚线/透明度）
-  addStyledPolyline as nativeAddStyledPolyline
+  addStyledPolyline as nativeAddStyledPolyline,
+  // v1.9.0: E0.3b styled 文本（CJK 基线=文字转位图）
+  addStyledText as nativeAddStyledText
 } from '@/uni_modules/beige-tdt-map'
 import globalConfig from '@/uni_modules/beige-tdt-map/config'
-import type { MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickDetail, GeoJsonLayerOptions } from '@/uni_modules/beige-tdt-map'
+import type { MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickDetail, GeoJsonLayerOptions, StyledTextOptions } from '@/uni_modules/beige-tdt-map'
 // v1.9.0: E0.1 GeoJSON 解析器（同目录纯 UTS 文件，零平台 API）
 import { parseGeoJsonFeatures, type GeoLatLng, type GeoParsedFeature } from './geojson.uts'
 
@@ -463,6 +465,9 @@ function drawStyledPolyline(points: Array<GeoLatLng>, color: string, width: numb
   }
   return nativeAddStyledPolyline(detail, color, width, dash, opacity)
 }
+
+// v1.9.0: E0.3b styled 文本（CJK 基线=文字转位图，经图像叠加通路锚定 lat/lng）
+function drawStyledText(lat: number, lng: number, text: string, options: StyledTextOptions): number { return nativeAddStyledText(lat, lng, text, options) }
 function drawCircle(lat: number, lng: number, radius: number, color: string, fillColor: string): number { return addCircle(lat, lng, radius, color, fillColor) }
 function drawRectangle(minLat: number, minLng: number, maxLat: number, maxLng: number, color: string, fillColor: string): number { return addRectangle(minLat, minLng, maxLat, maxLng, color, fillColor) }
 function drawLabel(lat: number, lng: number, text: string): number { return addLabel(lat, lng, text) }
@@ -638,12 +643,14 @@ let geoJsonLayerVisible = new Map<number, boolean>()                 // 层 ID �
 // 内部编排：解析产物 → 逐 feature 逐 ring 调 draw 原语。
 // 描边走 drawStyledPolyline（E0.3a：lineDash=null 实线 / 虚线如 [4,4]，opacity=1 对齐 chatbot）；
 // 填充仅作用外环（fill 自带 outline 传 fillColor 隐形化，描边统一由描边原语负责、线宽可控）；
-// 标注分支 CP-2a 暂不渲染（options.label 已完整解析入快照库，CP-2c 完成 drawStyledText 后接线）
+// 标注走 drawStyledText（E0.3b：label.field 文本 + positionField 锚点，二者缺失跳过不抛异常）
 function buildGeoJsonOverlays(features: Array<GeoParsedFeature>, options: GeoJsonLayerOptions): Array<number> {
   const ids: Array<number> = []
   let ringCount = 0
+  let labelCount = 0
   // 局部变量承接可空字段（判空后传参，规避 smart cast 不确定性）
   const fillColor = options.fillColor
+  const labelOpt = options.label
   for (let i = 0; i < features.length; i++) {
     const f = features[i]
     if (fillColor != null && f.rings.length > 0 && f.rings[0].length >= 3) {
@@ -655,9 +662,25 @@ function buildGeoJsonOverlays(features: Array<GeoParsedFeature>, options: GeoJso
       const strokeId = drawStyledPolyline(f.rings[j], options.lineColor, options.lineWidth, options.lineDash, 1.0)
       if (strokeId > 0) ids.push(strokeId)
     }
-    // 标注分支：CP-2c 接线（options.label 非空且 f.label 非空且锚点非空时 drawStyledText 于 f.anchor）
+    // 标注分支（E0.3b 接线）：文本缺失跳过；锚点缺失已由解析器回退外环质心
+    const fLabel = f.label
+    const fAnchorLat = f.anchorLat
+    const fAnchorLng = f.anchorLng
+    if (labelOpt != null && fLabel != null && fLabel.length > 0 && fAnchorLat != null && fAnchorLng != null) {
+      const textOpts: StyledTextOptions = {
+        fontSize: labelOpt.fontSize,
+        color: labelOpt.color,
+        haloColor: labelOpt.haloColor,
+        haloWidth: labelOpt.haloWidth
+      }
+      const textId = drawStyledText(fAnchorLat, fAnchorLng, fLabel, textOpts)
+      if (textId > 0) {
+        ids.push(textId)
+        labelCount++
+      }
+    }
   }
-  console.log('TDTMap: GeoJSON 编排完成 feature=' + features.length + ' ring=' + ringCount + ' 子覆盖物=' + ids.length)
+  console.log('TDTMap: GeoJSON 编排完成 feature=' + features.length + ' ring=' + ringCount + ' label=' + labelCount + ' 子覆盖物=' + ids.length)
   return ids
 }
 
@@ -870,7 +893,7 @@ defineExpose({
   zoomInOne, zoomOutOne, setMinZoomLevel, setMaxZoomLevel,
   panToLocation, centerAtZoom, setZoomEnabled, setDragEnabled,
   setMapMaxBounds, getCurrentBounds, convertGcj02ToWgs84,
-  drawPolyline, drawStyledPolyline, drawCircle, drawRectangle, drawLabel, batchMarkers, clearAllOverlays,
+  drawPolyline, drawStyledPolyline, drawStyledText, drawCircle, drawRectangle, drawLabel, batchMarkers, clearAllOverlays,
   removeOverlayById, showOverlayById, hideOverlayById,
   doCheckResize, doPlanBy, setViewportPoints, getMapSize,
   calculateDistance, calculateViewport, getMapCode,

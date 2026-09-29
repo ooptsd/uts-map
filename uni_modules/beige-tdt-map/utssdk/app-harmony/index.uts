@@ -686,6 +686,30 @@ export function addStyledPolyline(points: Array<MapClickDetail>, color: string, 
     return id
 }
 
+// v1.9.0: E0.3b styled 文本——鸿蒙降级档：MapKit 无离屏文字位图管线（UTS 侧无已验证的
+// drawing/render 通道），且 MapKit 注记 title 非常显文本（与 Android 同需交互触发）。
+// 按子模块平台差异惯例显式上报（console.warn + code=5）并返回 0（无地名降级档，登记偏差）；
+// 遗留项：后续接入 @ohos.graphics.drawing 离屏绘制 → PixelMap → 既有图片覆盖物通路
+type StyledTextOptions = {
+    fontSize: number
+    color: string
+    haloColor: string | null
+    haloWidth: number
+}
+
+let styledTextWarned: boolean = false
+
+export function addStyledText(lat: number, lng: number, text: string, options: StyledTextOptions): number {
+    if (!styledTextWarned) {
+        styledTextWarned = true
+        console.warn("TDTMap: 鸿蒙端暂不支持 styled 文本标注（无离屏文字位图管线），已跳过: " + text)
+    }
+    if (onErrorCallback != null) {
+        onErrorCallback({ code: 5, message: '平台不支持：鸿蒙端 styled 文本标注暂未实现（无地名降级档）' })
+    }
+    return 0
+}
+
 // ==================== 覆盖物：圆（鸿蒙原生支持） ====================
 
 // context7 验证：addCircle 返回 Promise<MapCircle>，改用预分配 ID + .then() 同步返回 number

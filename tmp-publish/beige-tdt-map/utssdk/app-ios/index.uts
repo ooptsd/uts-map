@@ -16,13 +16,16 @@ import { NSPredicate, NSDictionary } from "Foundation"
 import { MLNCoordinateBoundsMake } from "MapLibre"
 import { CLLocationCoordinate2DMake, CLLocationManager, CLLocation } from "CoreLocation"
 import { UITapGestureRecognizer, UILongPressGestureRecognizer, UIColor, UIGraphicsImageRenderer, UIImagePNGRepresentation, UIImage } from "UIKit"
+// v1.9.0: E0.3b styled 文本（UIGraphicsImageRenderer 文字转位图）
+import { UIFont, UIScreen } from "UIKit"
 import { UIEdgeInsets } from "UIKit"
 import { NSURL, NSExpression, NSBundle, NSString } from "Foundation"
+import { NSMutableDictionary } from "Foundation"
 // v1.9.0: 图片覆盖物（MLNImageSource + MLNRasterStyleLayer）
 import { MLNImageSource } from "MapLibre"
 // v1.9.0: mapType='blank' 白底层（E0 配套）
 import { MLNBackgroundStyleLayer } from "MapLibre"
-import { TDMapOptions, MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MapClickCallback, MapReadyCallback, MapErrorCallback, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickCallback, GeoJsonReplayCallback } from '../interface.uts'
+import { TDMapOptions, MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MapClickCallback, MapReadyCallback, MapErrorCallback, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickCallback, GeoJsonReplayCallback, StyledTextOptions } from '../interface.uts'
 
 // ⚠️ 天地图 Key 类型说明（自新系统升级后严格区分，混用会导致瓦片不显示）:
 //   - "浏览器端" key：校验 Referer 头 + 域名白名单 → 原生 App 不发送浏览器 Referer → 403 被拒 → 灰白背景
@@ -614,6 +617,96 @@ export function addStyledPolyline(points: Array<MapClickDetail>, color: string, 
         }
         return 0
     }
+}
+
+// ══════════════════════════════════════════════
+// v1.9.0 新增：E0.3b styled 文本（基线=文字转位图 E0.3b-F）
+// ══════════════════════════════════════════════
+// CJK 供应链现状：三端 glyphs 指 demotiles（国内不可达），SymbolLayer text-field 大概率静默失败，
+// 基线档位=UIGraphicsImageRenderer 绘制文字位图 → 既有图像叠加通路锚定 lat/lng。
+
+// NSString 取 start 起 2 字符的十六进制值（NSString 无 (start,end) 双参子串，FromIndex+ToIndex 组合；
+// substringFromIndex 参数为 Int，UTS number 需显式 toInt()）
+function hexPair(hex: string, start: number): number {
+    const rest = hex.substringFromIndex(start.toInt())
+    return parseInt(rest.substringToIndex(2), 16)
+}
+
+// styled 颜色解析：支持 #rrggbb 与 #rrggbbaa（style spec 约定 alpha 在后；
+// 注意与 parseColor 的 AARRGGBB（alpha 在前）约定不同）
+function parseStyledColor(color: string): UIColor {
+    let hex = color
+    if (hex.hasPrefix('#')) {
+        hex = hex.substringFromIndex(1)
+    }
+    if (hex.length == 8) {
+        const r = hexPair(hex, 0)
+        const g = hexPair(hex, 2)
+        const b = hexPair(hex, 4)
+        const a = hexPair(hex, 6)
+        return UIColor.colorWithRed(r / 255.0, g / 255.0, b / 255.0, a / 255.0)
+    }
+    return parseColor(color)
+}
+
+export function addStyledText(lat: number, lng: number, text: string, options: StyledTextOptions): number {
+    if (mapView == null || mapView.style == null || text.length == 0) return 0
+    const mv = mapView
+    // 位图按物理像素乘 screenScale 绘制（bounds 按逻辑尺寸换算，位图拉伸到 bounds 后保持锐利）
+    const scale = UIScreen.mainScreen.scale
+    const fontSizePx = options.fontSize * scale
+    const haloPx = options.haloWidth * scale
+    const font = UIFont.systemFontOfSize(fontSizePx)
+    // attrs 用 NSMutableDictionary；key 直接传 NSAttributedString 原始常量字符串值（"NSFont"/"NSColor"），
+    // 规避 NSAttributedString.Key 类型桥接（UTS 无该类型 import 路径）
+    const attrs = new NSMutableDictionary()
+    attrs.setObject(font, "NSFont")
+    const nsText = text as NSString
+    const textSize = nsText.sizeWithAttributes(attrs)
+    const pad = (options.haloColor != null && haloPx > 0 ? haloPx : 0) + scale
+    const totalW = textSize.width + pad * 2
+    const totalH = textSize.height + pad * 2
+    if (totalW <= 0 || totalH <= 0) return 0
+    const renderer = UIGraphicsImageRenderer(CGSizeMake(totalW, totalH))
+    const uiImage = renderer.imageWithActions((context) => {
+        if (options.haloColor != null && haloPx > 0) {
+            attrs.setObject(parseStyledColor(options.haloColor), "NSColor")
+            // 八方向偏移绘制 halo（Android stroke 描边同视觉；跳过中心偏移留给填充）
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    if (dx == 0 && dy == 0) continue
+                    nsText.drawAtPoint(CGPointMake(pad + dx * haloPx, pad + dy * haloPx), attrs)
+                }
+            }
+        }
+        attrs.setObject(parseStyledColor(options.color), "NSColor")
+        nsText.drawAtPoint(CGPointMake(pad, pad), attrs)
+    })
+    // bounds 换算（当前 zoom 屏幕等尺寸）：256 tileSize 标准 worldPx 公式（组件层 latLngToScreen 同源）
+    const zoom = mv.zoomLevel
+    const worldPx = 256 * Math.pow(2, zoom)
+    const halfLng = (totalW / 2) * 360 / worldPx
+    const latRad = lat * Math.PI / 180
+    const halfLat = (totalH / 2) * 360 / worldPx / Math.cos(latRad)
+    if (!(halfLng > 0) || !(halfLat > 0)) return 0
+    // 复用图像叠加通路（type=styledText；attach 回填 ext 供样式重建重放，uiImage 位图复用）
+    overlayIdCounter++
+    const id = overlayIdCounter
+    const params: ImageOverlayOptions = {
+        southwest: { lat: lat - halfLat, lng: lng - halfLng },
+        northeast: { lat: lat + halfLat, lng: lng + halfLng },
+        image: '',
+        transparency: 0,
+        bearing: 0,
+        visible: true,
+        clickable: false
+    }
+    overlayMap.set(id, { id: id, type: 'styledText', nativeRef: null, isVisible: true })
+    if (!attachImageOverlayToStyle(id, params, uiImage)) {
+        overlayMap.delete(id)
+        return 0
+    }
+    return id
 }
 
 // ==================== 覆盖物：圆（多边形近似，36 边） ====================
@@ -1608,8 +1701,8 @@ function rebuildUserLayersAfterStyle(): void {
         heatmapOptionsRef = null
         addHeatmap(pts, opts)
     }
-    // v1.9.0: 图片覆盖物重放（uiImage 本地加载的复用持有；URL 的交给引擎重新下载；
-    // 重建 entry 由 attach 回填，隐藏过的以快照恢复）
+    // v1.9.0: 图片覆盖物重放（uiImage 本地加载/文本位图的复用持有；URL 的交给引擎重新下载；
+    // 重建 entry 由 attach 回填，隐藏过的以快照恢复；styledText 同为 image 通路一并重放）
     if (imageOverlayIds.length > 0) {
         const savedImgs: Array<any> = []
         for (let i = 0; i < imageOverlayIds.length; i++) {
@@ -1617,7 +1710,7 @@ function rebuildUserLayersAfterStyle(): void {
             const ext = imageOverlayExt.get(oid)
             const entry0 = overlayMap.get(oid)
             if (ext != null) {
-                savedImgs.push({ id: oid, params: ext.params, visible: entry0 != null ? entry0.isVisible : true })
+                savedImgs.push({ id: oid, params: ext.params, uiImage: ext.uiImage, visible: entry0 != null ? entry0.isVisible : true })
             }
         }
         imageOverlayExt.clear()
@@ -1625,7 +1718,7 @@ function rebuildUserLayersAfterStyle(): void {
         for (let i = 0; i < savedImgs.length; i++) {
             const oid = savedImgs[i].id as number
             overlayMap.set(oid, { id: oid, type: 'image', nativeRef: null, isVisible: true })
-            const okAttach = attachImageOverlayToStyle(oid, savedImgs[i].params as ImageOverlayOptions)
+            const okAttach = attachImageOverlayToStyle(oid, savedImgs[i].params as ImageOverlayOptions, savedImgs[i].uiImage)
             if (okAttach) {
                 const snapVisible = savedImgs[i].visible as boolean
                 const entry2 = overlayMap.get(oid)
@@ -2030,7 +2123,8 @@ function placeImageLayerByZIndex(layer: MLNRasterStyleLayer, z: number | null, e
 // 创建 source+layer 挂载到当前 style 并回填状态；返回 false 表示加载失败（本机路径不存在等）
 // ⚠️ 编译期验证项：MLNImageSource 初始化器 named 参数桥接（initWithIdentifier:coordinateQuad:url:/image:）；
 // 若桥接报错，改用先构造后赋值（source.URL = / setImage 类 setter），记录到 Task 验证项
-function attachImageOverlayToStyle(id: number, params: ImageOverlayOptions): boolean {
+// v1.9.0: presetImage 非 null 时跳过 URL/路径加载直接使用（E0.3b styled 文本位图通路）
+function attachImageOverlayToStyle(id: number, params: ImageOverlayOptions, presetImage: any | null): boolean {
     const style = mapView?.style
     if (style == null) return false
     const sourceId = "img-overlay-src-" + id
@@ -2038,8 +2132,10 @@ function attachImageOverlayToStyle(id: number, params: ImageOverlayOptions): boo
     const quad = buildCoordinateQuad(computeImageQuad(params.southwest, params.northeast, params.bearing ?? 0))
     const isHttp = params.image.indexOf("http://") == 0 || params.image.indexOf("https://") == 0
     let source: MLNImageSource
-    let uiImg: any | null = null
-    if (isHttp) {
+    let uiImg: any | null = presetImage
+    if (uiImg != null) {
+        source = new MLNImageSource(sourceId, coordinateQuad: quad, image: uiImg as UIImage)
+    } else if (isHttp) {
         // URL 直载：引擎内部异步下载（规避 UTS 无异步下载先例）
         const nsurl = NSURL.URLWithString(params.image)
         if (nsurl == null) {
@@ -2087,7 +2183,7 @@ export function addImageOverlay(params: ImageOverlayOptions): number {
     }
     const id = allocateOverlayId('image', null)
     try {
-        if (!attachImageOverlayToStyle(id, params)) {
+        if (!attachImageOverlayToStyle(id, params, null)) {
             overlayMap.delete(id)
             return 0
         }
@@ -2134,7 +2230,7 @@ export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOption
                 } catch (e2: any) { /* 旧样式残留容忍 */ }
                 imageOverlayIds = imageOverlayIds.filter(x => x != id)
                 imageOverlayExt.delete(id)
-                if (!attachImageOverlayToStyle(id, p)) {
+                if (!attachImageOverlayToStyle(id, p, null)) {
                     overlayMap.delete(id)
                 } else {
                     // 保持 entry.isVisible 与重建层一致

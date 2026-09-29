@@ -7,6 +7,12 @@
 - 🖱️ 点击检测：MapLibre 三端统一几何 hit-test（raster 图层无要素，不用 queryRenderedFeatures），命中互斥消费 mapClick；鸿蒙原生 imageOverlayClick（getId 反查插件 ID）
 - 🖼️ 图片来源：http(s) URL 与本机缓存绝对路径（缓存由调用方维护）；Web 端仅 http(s)/data: URL，本机路径上报 code=4
 - 🔁 setStyle 后图片覆盖物随用户图层自动重建（MapLibre 三端，同 ID 保序）；异步加载中 update 合并应用、失败上报 code=2/4 且 ID 失效
+- 🧩 新增：GeoJSON 图层 `addGeoJsonLayer` / `removeGeoJsonLayer` / `showGeoJsonLayer` / `hideGeoJsonLayer`（组件层，E0）——入参 GeoJSON 字符串一次解析（FeatureCollection/Feature/Polygon/MultiPolygon/LineString/MultiLineString），外环+内环（洞边）均描边、填充仅外环，properties 读标注文本与锚点（缺失回退外环质心，坏数据不抛异常）；层注册表纳入 clearAllOverlays 清理链
+- 🔁 新增：`setGeoJsonReplayCallback`——Android/iOS/Web 样式重建（setStyle/removeStyle/switchMapType）后通知组件层按快照重放 GeoJSON 层（恢复隐藏态）；并修复 Android switchMapType 未重放用户图层的既有缺陷
+- ➖ 新增：`addStyledPolyline` / `drawStyledPolyline`（E0.3a）——虚线 dash 数组与 opacity（缺省 1.0）；Android LineLayer+GeoJsonSource、iOS lineDashpattern/lineOpacity、Web line-dasharray/line-opacity；鸿蒙无 dash 参数降级实线（警告）+ opacity 并入颜色 alpha。legacy addPolyline 行为零变化
+- 🔤 新增：`addStyledText` / `drawStyledText`（E0.3b，CJK 基线=文字转位图）——fontSize/color/haloColor(#rrggbbaa 半透明)/haloWidth，Android Canvas / iOS UIGraphicsImageRenderer / Web canvas→dataURL，位图经既有图像叠加通路锚定 lat/lng；鸿蒙暂无离屏文字管线上报 code=5 降级（无地名档）
+- ⬜ 新增：mapType='blank' 白底样式——background #ffffff + glyphs（Android/Web 走 GLYPHS_ENDPOINT 集中常量、iOS MLNBackgroundStyleLayer、Web 三路径）；鸿蒙 MapKit 无样式 JSON 回退 vec（console.warn + code=5）
+- 📝 版本号 1.6.0 → 1.9.0 对齐代码
 
 ## 1.8.0（发布时填写日期）
 

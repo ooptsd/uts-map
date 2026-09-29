@@ -177,6 +177,7 @@
           <button class="btn" @tap="demoAddGeoPolygon">基本多边形</button>
           <button class="btn" @tap="demoAddGeoMultiHole">多面带洞</button>
           <button class="btn" @tap="demoAddGeoDashLine">邻省虚线</button>
+          <button class="btn" @tap="demoAddGeoLabels">粤界标注</button>
           <button class="btn" @tap="demoHideGeoLayer">隐藏整层</button>
           <button class="btn" @tap="demoShowGeoLayer">显示整层</button>
           <button class="btn btn-danger" @tap="demoRemoveGeoLayer">移除整层</button>
@@ -191,7 +192,7 @@
 
 <script setup lang="uts">
 import { ref } from 'vue'
-import type { MapClickDetail, MapErrorDetail, MapBoundsDetail, GeocodeCallback, SearchOptions, ClusterOptions, HeatmapItem, ImageOverlayClickDetail, GeoJsonLayerOptions } from '@/uni_modules/beige-tdt-map'
+import type { MapClickDetail, MapErrorDetail, MapBoundsDetail, GeocodeCallback, SearchOptions, ClusterOptions, HeatmapItem, ImageOverlayClickDetail, GeoJsonLayerOptions, GeoJsonLabelStyle } from '@/uni_modules/beige-tdt-map'
 
 const mapRef = ref(null as any | null)
 const coordResult = ref('')
@@ -754,13 +755,21 @@ const GEOJSON_FIXTURE_MULTI_HOLE: string = '{"type":"FeatureCollection","feature
 let lastGeoLayerId: number = 0
 
 function demoAddGeoPolygon(): void {
-  // 市界样式用例：实线 #4475E4 宽 1 + 半透明填充（无标注——标注 fixture 在 CP-2c 后启用）
+  // 市界样式用例：实线 #4475E4 宽 1 + 半透明填充 + 中文标注（name 文本 / centroid 锚点，白字黑描边 12px）
+  const label: GeoJsonLabelStyle = {
+    field: 'name',
+    fontSize: 12,
+    color: '#ffffff',
+    haloColor: '#000000',
+    haloWidth: 2,
+    positionField: 'centroid'
+  }
   const opts: GeoJsonLayerOptions = {
     lineColor: '#4475E4',
     lineWidth: 1,
     lineDash: null,
     fillColor: '#4475E422',
-    label: null
+    label: label
   }
   const id = mapRef.value?.addGeoJsonLayer(GEOJSON_FIXTURE_POLYGON, opts) ?? 0
   lastGeoLayerId = id
@@ -796,6 +805,54 @@ function demoAddGeoDashLine(): void {
   const id = mapRef.value?.addGeoJsonLayer(GEOJSON_FIXTURE_DASH_LINE, opts) ?? 0
   lastGeoLayerId = id
   infoText.value = id > 0 ? 'GeoJSON 层 #' + id + ' 已加载（灰虚线 [4,4]，lineWidth=1）' : 'GeoJSON 层加载失败'
+}
+
+// 中文标注用例（E0.3b）：两层叠加对齐 chatbot 视觉——邻省层先建（虚线灰界 + 邻省名 11px #aaa
+// 白半透明描边 rgba(255,255,255,0.6)=#ffffff99），城市层后建（#4475E4 市界 + 市名 12px 白字黑描边）。
+// 鸿蒙端 label 降级跳过（mapError code=5，无地名降级档）
+const GEOJSON_GD_NEIGHBOR: string = '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"湖南省","centroid":[112.98,24.6]},"geometry":{"type":"LineString","coordinates":[[111.4,24.2],[112.2,24.0],[112.9,23.6],[113.6,23.9],[114.2,24.3]]}}]}'
+const GEOJSON_GD_CITIES: string = '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"广州市","centroid":[113.35,23.15]},"geometry":{"type":"Polygon","coordinates":[[[112.95,22.95],[113.55,22.9],[113.62,23.35],[113.15,23.4],[112.95,22.95]]]}},{"type":"Feature","properties":{"name":"深圳市","centroid":[114.1,22.58]},"geometry":{"type":"Polygon","coordinates":[[[113.75,22.45],[114.3,22.42],[114.32,22.75],[113.78,22.72],[113.75,22.45]]]}}]}'
+let gdNeighborLayerId: number = 0
+let gdCityLayerId: number = 0
+
+function demoAddGeoLabels(): void {
+  // 视野移到广东
+  mapRef.value?.moveToCenter(23.1, 113.7)
+  mapRef.value?.zoomTo(7)
+  const neighborLabel: GeoJsonLabelStyle = {
+    field: 'name',
+    fontSize: 11,
+    color: '#aaaaaa',
+    haloColor: '#ffffff99',
+    haloWidth: 2,
+    positionField: 'centroid'
+  }
+  const neighborOpts: GeoJsonLayerOptions = {
+    lineColor: '#aaaaaa',
+    lineWidth: 1,
+    lineDash: [4, 4],
+    fillColor: null,
+    label: neighborLabel
+  }
+  const cityLabel: GeoJsonLabelStyle = {
+    field: 'name',
+    fontSize: 12,
+    color: '#ffffff',
+    haloColor: '#000000',
+    haloWidth: 2,
+    positionField: 'centroid'
+  }
+  const cityOpts: GeoJsonLayerOptions = {
+    lineColor: '#4475E4',
+    lineWidth: 1,
+    lineDash: null,
+    fillColor: null,
+    label: cityLabel
+  }
+  gdNeighborLayerId = mapRef.value?.addGeoJsonLayer(GEOJSON_GD_NEIGHBOR, neighborOpts) ?? 0
+  gdCityLayerId = mapRef.value?.addGeoJsonLayer(GEOJSON_GD_CITIES, cityOpts) ?? 0
+  lastGeoLayerId = gdCityLayerId
+  infoText.value = '邻省层 #' + gdNeighborLayerId + ' + 城市层 #' + gdCityLayerId + ' 已加载（断言：市名白字黑边 12px、邻省名灰 11px 白半透明边；logcat 查看 label 计数）'
 }
 
 function demoHideGeoLayer(): void {

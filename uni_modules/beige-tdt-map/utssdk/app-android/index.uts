@@ -19,6 +19,8 @@ import { MarkerOptions, Marker } from "org.maplibre.android.annotations"
 import { PolygonOptions, Polygon } from "org.maplibre.android.annotations"
 import { PolylineOptions, Polyline } from "org.maplibre.android.annotations"
 import { Color, BitmapFactory, Bitmap } from "android.graphics"
+// v1.9.0: E0.3b styled 文本（Canvas 文字转位图）
+import { Paint, Canvas } from "android.graphics"
 // v1.9.0: 图片覆盖物（ImageSource+RasterLayer / 本机路径两段解码）
 import { ImageSource } from "org.maplibre.android.style.sources"
 import { LatLngQuad } from "org.maplibre.android.geometry"
@@ -38,7 +40,8 @@ import {
     ClusterOptions, HeatmapItem, HeatmapOptions,
     TileLayerOptions,
     ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickCallback,
-    GeoJsonReplayCallback
+    GeoJsonReplayCallback,
+    StyledTextOptions
 } from '../interface.uts'
 
 // ⚠️ 天地图 Key 类型说明（自新系统升级后严格区分，混用会导致瓦片不显示）:
@@ -714,6 +717,102 @@ function clearStyledPolylinesInternal(): void {
     styledPolylines = []
 }
 
+// ══════════════════════════════════════════════
+// v1.9.0 新增：E0.3b styled 文本（基线=文字转位图 E0.3b-F）
+// ══════════════════════════════════════════════
+// CJK 供应链现状：三端 glyphs 指 demotiles（国内不可达），SymbolLayer text-field 大概率静默失败，
+// 基线档位=Canvas 绘制文字位图 → 既有图像叠加通路（attachImageOverlayToStyle）锚定 lat/lng。
+// 上行档位（SymbolLayer+glyphs）待 S0.5 端点就绪后另行接入，本函数即位图基线。
+
+// styled 颜色解析：支持 #rrggbb 与 #rrggbbaa（style spec 约定 alpha 在后）。
+// 注意与 Color.parseColor 的 #aarrggbb（alpha 在前）不同——8 位时换位后再解析，
+// 避免位运算/Long 溢出问题（Color.parseColor 返回 32 位 Int 负值属正常）
+function parseStyledColor(color: string): number {
+    if (color.length == 9 && color.charAt(0) == '#') {
+        const rgb = color.substring(1, 7)
+        const a = color.substring(7, 9)
+        return Color.parseColor('#' + a + rgb)
+    }
+    return Color.parseColor(color)
+}
+
+export function addStyledText(lat: number, lng: number, text: string, options: StyledTextOptions): number {
+    const m = mapLibreMap
+    const style = m?.getStyle()
+    if (m == null || style == null || text.length == 0) return 0
+    const errorCb = onErrorCallback
+    try {
+        // 位图按物理像素乘 density 绘制（bounds 按逻辑尺寸换算，位图拉伸到 bounds 后保持锐利）
+        const ctx = mapView?.getContext()
+        let density = 1.0
+        if (ctx != null) {
+            density = ctx.getResources().getDisplayMetrics().density.toDouble()
+        }
+        const fontSizePx = options.fontSize * density
+        const haloWidthPx = options.haloWidth * density
+        const pad = (options.haloColor != null && haloWidthPx > 0 ? haloWidthPx : 0) + density
+
+        const paint = new Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.setTextSize(fontSizePx.toFloat())
+        const textWidth = paint.measureText(text)
+        const fm = paint.getFontMetrics()
+        const textHeight = (fm.descent.toDouble() - fm.ascent.toDouble())
+        const bmpW = Math.ceil(textWidth.toDouble() + pad * 2).toInt()
+        const bmpH = Math.ceil(textHeight + pad * 2).toInt()
+        if (bmpW <= 0 || bmpH <= 0) return 0
+        const bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
+        const canvas = new Canvas(bmp)
+        // 文字基线：ascent 为负值，baselineY = pad - ascent 使文本顶部落在 pad
+        const baselineY = (pad - fm.ascent.toDouble())
+        if (options.haloColor != null && haloWidthPx > 0) {
+            // halo 描边：加宽 stroke（haloWidth*2 补偿双向各半）先画后填充（Web/iOS 八方向偏移同视觉）
+            paint.setStyle(Paint.Style.STROKE)
+            paint.setStrokeWidth((haloWidthPx * 2).toFloat())
+            paint.setColor(parseStyledColor(options.haloColor))
+            canvas.drawText(text, pad.toFloat(), baselineY.toFloat(), paint)
+        }
+        paint.setStyle(Paint.Style.FILL)
+        paint.setColor(parseStyledColor(options.color))
+        canvas.drawText(text, pad.toFloat(), baselineY.toFloat(), paint)
+
+        // bounds 换算（当前 zoom 屏幕等尺寸）：256 tileSize 标准 worldPx 公式（组件层 latLngToScreen 同源）
+        const camPos = m.getCameraPosition()
+        const zoom = camPos != null ? camPos.zoom : 10.0
+        const worldPx = 256 * Math.pow(2, zoom.toDouble())
+        const logicalW = bmpW.toDouble() / density
+        const logicalH = bmpH.toDouble() / density
+        const halfLng = (logicalW / 2) * 360 / worldPx
+        const latRad = lat * Math.PI / 180
+        const halfLat = (logicalH / 2) * 360 / worldPx / Math.cos(latRad)
+        if (!(halfLng > 0) || !(halfLat > 0)) {
+            bmp.recycle()
+            return 0
+        }
+
+        // 复用图像叠加通路（type=styledText 与 image 同款 {source,layer} 管理；attach 回填 ext 供样式重建重放）
+        overlayIdCounter++
+        const id = overlayIdCounter
+        const params: ImageOverlayOptions = {
+            southwest: { lat: lat - halfLat, lng: lng - halfLng },
+            northeast: { lat: lat + halfLat, lng: lng + halfLng },
+            image: '',
+            transparency: 0,
+            bearing: 0,
+            visible: true,
+            clickable: false
+        }
+        overlayMap.set(id, { id: id, type: 'styledText', nativeRef: null, isVisible: true })
+        attachImageOverlayToStyle(id, params, style, bmp)
+        return id
+    } catch (e: any) {
+        console.error("TDTMap: 添加 styled 文本失败: " + e.message)
+        if (errorCb != null) {
+            errorCb({ code: 4, message: "添加 styled 文本失败: " + e.message })
+        }
+        return 0
+    }
+}
+
 // ==================== 覆盖物：圆（多边形近似，36 边） ====================
 
 const EARTH_RADIUS = 6378137.0
@@ -1197,7 +1296,7 @@ export function removeOverlay(id: number): void {
                 }
             }
             styledPolylines = styledPolylines.filter(sp => sp !== spRef)
-        } else if (entry.type == 'image') {
+        } else if (entry.type == 'image' || entry.type == 'styledText') { // v1.9.0: styledText 同为 image 通路 {source,layer}
             // v1.9.0: 图片覆盖物为 style 层系（source+layer），非 annotation 体系
             const style = m.getStyle()
             if (style != null) {
@@ -1251,7 +1350,7 @@ export function showOverlay(id: number): void {
             } else if (entry.type == 'styledPolyline') {
                 // v1.9.0: LineLayer 须用 Layer.setVisible（显式拦截，防落入末尾 Polygon 分支）
                 (ref as StyledPolylineEntry).layer.setVisible(true)
-            } else if (entry.type == 'image') {
+            } else if (entry.type == 'image' || entry.type == 'styledText') { // v1.9.0: styledText 同为 image 通路 {source,layer}
                 // v1.9.0: RasterLayer 无 setAlpha，须用 Layer.setVisible（必须显式拦截，否则落入末尾 Polygon 分支）
                 (ref.layer as RasterLayer).setVisible(true)
                 const extShow = imageOverlayExt.get(id)
@@ -1285,7 +1384,7 @@ export function hideOverlay(id: number): void {
             } else if (entry.type == 'styledPolyline') {
                 // v1.9.0: LineLayer 须用 Layer.setVisible（显式拦截，防落入末尾 Polygon 分支）
                 (ref as StyledPolylineEntry).layer.setVisible(false)
-            } else if (entry.type == 'image') {
+            } else if (entry.type == 'image' || entry.type == 'styledText') { // v1.9.0: styledText 同为 image 通路 {source,layer}
                 // v1.9.0: RasterLayer 无 setAlpha，须用 Layer.setVisible（必须显式拦截，否则落入末尾 Polygon 分支）
                 (ref.layer as RasterLayer).setVisible(false)
                 const extHide = imageOverlayExt.get(id)

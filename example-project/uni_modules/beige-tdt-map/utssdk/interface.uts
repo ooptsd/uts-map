@@ -325,3 +325,19 @@ export declare function setGeoJsonReplayCallback(callback: GeoJsonReplayCallback
 // Web 参数化 line-dasharray/line-opacity；鸿蒙 MapKit 折线无 dash 参数，忽略 dash 降级实线（console 警告），
 // opacity 并入颜色 alpha 通道。返回 overlay ID（0=失败），与 removeOverlay/showOverlay/hideOverlay 统一管理
 export declare function addStyledPolyline(points: Array<MapClickDetail>, color: string, width: number, dash: Array<number> | null, opacity?: number): number
+
+// styled 文本选项（E0.3b）：fontSize 单位 px；haloColor 支持 #rrggbb / #rrggbbaa
+// （半透明格式 alpha 在后，MapLibre style spec 约定；注意与既有 fillColor 的 #aarrggbb 约定不同）
+export type StyledTextOptions = {
+    fontSize: number
+    color: string
+    haloColor: string | null
+    haloWidth: number
+}
+
+// 添加常显文本标注（E0.3b，CJK 基线=文字转位图 E0.3b-F）：三端绘制文字位图（含 halo 八方向描边）
+// 经既有图像叠加通路锚定到 lat/lng（bounds 按当前 zoom 换算为屏幕等尺寸，位图乘 density 保清晰；
+// 缩放时随地图同比例缩放为已知特性）。Android Canvas / iOS UIGraphicsImageRenderer / Web canvas→dataURL。
+// 与 addLabel（Marker title/Popup，需交互触发）并行；鸿蒙 MapKit 无离屏文字位图管线，上报 code=5 并返回 0
+// （无地名降级档，可后续接入 PixelMap 通路）。返回 overlay ID（0=失败），统一 overlay 管理体系
+export declare function addStyledText(lat: number, lng: number, text: string, options: StyledTextOptions): number
