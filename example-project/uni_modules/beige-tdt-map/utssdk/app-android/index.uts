@@ -35,7 +35,8 @@ import {
     MapLongClickCallback, CameraChangeCallback,
     ClusterOptions, HeatmapItem, HeatmapOptions,
     TileLayerOptions,
-    ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickCallback
+    ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickCallback,
+    GeoJsonReplayCallback
 } from '../interface.uts'
 
 // ⚠️ 天地图 Key 类型说明（自新系统升级后严格区分，混用会导致瓦片不显示）:
@@ -139,9 +140,26 @@ function getLabelLayerName(mt: string): string {
     return 'cva'
 }
 
+// v1.9.0: glyphs 字体端点集中常量（当前为 demotiles 占位值；⚠️ demotiles 国内不可达，
+// S0.5 端点选型（国内可达 PBF 服务 vs 本地字体资产）后在此一行替换，三端同款常量同步修改）
+const GLYPHS_ENDPOINT = "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf"
+
+// v1.9.0: mapType='blank' 白底样式（E0 配套）。空 layers 非白底（画布透明透出原生底色且三端不一致），
+// 必须显式 background #ffffff；glyphs 必须显式存在——style spec 强制校验：缺 glyphs 的
+// text-field 图层被静默拒绝（Task 10 浏览器实测发现，context7 验证）
+function buildBlankStyleJson(): string {
+    return '{"version":8,"glyphs":"' + GLYPHS_ENDPOINT + '","name":"tdt-blank","sources":{},"layers":[' +
+        '{"id":"tdt-bg","type":"background","paint":{"background-color":"#ffffff"}}]}'
+}
+
 // 构建包含天地图 sources + layers 的完整 style JSON
 // 性能优化：仅创建当前激活的图层类型（2 source + 2 layer），避免 6 个 RasterSource 同时驻留
 function buildTiandituStyleJson(apiKey: string, activeMapType: string): string {
+    // v1.9.0: blank 白底（无天地图瓦片，无需 apiKey，无诊断 URL）
+    if (activeMapType == 'blank') {
+        console.log("TDTMap: 构建白底样式（mapType=blank）")
+        return buildBlankStyleJson()
+    }
     console.log("TDTMap: 构建天地图样式, key_len=" + apiKey.length + " active=" + activeMapType)
 
     const base = getBaseLayerName(activeMapType)
@@ -154,7 +172,7 @@ function buildTiandituStyleJson(apiKey: string, activeMapType: string): string {
 
     // v1.7.0: glyphs 字体端点（style spec 强制校验：text-field 图层需 style 含 glyphs，
     // 否则符号图层被静默拒绝，聚合数字标签不渲染——Task 10 浏览器实测发现，context7 验证）
-    let json = '{"version":8,"glyphs":"https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf","name":"tdt-tianditu","sources":{'
+    let json = '{"version":8,"glyphs":"' + GLYPHS_ENDPOINT + '","name":"tdt-tianditu","sources":{'
     json += '"tdt-base":{"type":"raster","tiles":[' + buildTileUrlsJSON(base, apiKey) + '],"tileSize":256,"minzoom":1,"maxzoom":18}'
     json += ',"tdt-label":{"type":"raster","tiles":[' + buildTileUrlsJSON(label, apiKey) + '],"tileSize":256,"minzoom":1,"maxzoom":18}'
     json += '},"layers":['
@@ -451,6 +469,9 @@ export function switchMapType(mapType: string): void {
     console.log("TDTMap: 切换地图类型 -> " + mapType)
     m.setStyle(new Style.Builder().fromJson(styleJson), (style: Style) => {
         console.log("TDTMap: 地图类型已切换为 " + mapType)
+        // v1.9.0: 补齐样式重建链——switchMapType 同为整样式替换，此前未重放用户图层
+        // （自定义瓦片/聚合/热力/图片覆盖物会静默丢失）；与 setStyle/removeStyle 对齐
+        rebuildUserLayersAfterStyle()
     })
 }
 
@@ -2094,6 +2115,19 @@ export function setImageOverlayClickCallback(callback: ImageOverlayClickCallback
 }
 
 // ══════════════════════════════════════════════
+// v1.9.0 新增：E0 GeoJSON 层重放通知
+// ══════════════════════════════════════════════
+
+// GeoJSON 层快照与编排逻辑在组件层（tdt-map.uvue）；原生层在 rebuildUserLayersAfterStyle
+// 末尾触发本回调，通知组件层按快照重放已注册的 GeoJSON 层（仿图片覆盖物"快照→样式就绪→重建"模式）
+let geoJsonReplayCallback: GeoJsonReplayCallback | null = null
+
+@UTSJS.keepAlive
+export function setGeoJsonReplayCallback(callback: GeoJsonReplayCallback | null): void {
+    geoJsonReplayCallback = callback
+}
+
+// ══════════════════════════════════════════════
 // v1.3.0 新增：自定义瓦片图层
 // ══════════════════════════════════════════════
 
@@ -2263,6 +2297,11 @@ function rebuildUserLayersAfterStyle(): void {
                 }
             }
         }
+    }
+    // v1.9.0: E0 GeoJSON 层重放通知（组件层持有 geojson/options 快照与编排逻辑，原生层只负责通知时机）
+    const replayCb = geoJsonReplayCallback
+    if (replayCb != null) {
+        replayCb()
     }
 }
 

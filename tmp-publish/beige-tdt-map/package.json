@@ -1,114 +1,55 @@
 {
   "id": "beige-tdt-map",
   "name": "天地图UTS原生插件（uni-app x 蒸汽模式）",
-  "version": "1.6.0",
+  "version": "1.9.0",
   "description": "天地图UTS原生插件，GPU渲染，Android/iOS/鸿蒙/Web四端统一。支持矢量影像地形切换、定位、标记与覆盖物、天地图搜索、坐标转换、截图、手势控制",
   "uni_modules": {
     "dependencies": [],
     "encrypt": [],
     "platforms": {
       "cloud": {
-        "tcb": "√",
-        "aliyun": "√",
-        "alipay": "x"
+        "tcb": "y",
+        "aliyun": "y"
       },
       "client": {
-        "uni-app": {
-          "vue": {
-            "vue2": "-",
-            "vue3": "-"
-          },
-          "web": {
-            "safari": "-",
-            "chrome": "-"
-          },
-          "app": {
-            "vue": "-",
-            "nvue": "-",
-            "android": "-",
-            "ios": "-",
-            "harmony": "-"
-          },
-          "mp": {
-            "weixin": "-",
-            "alipay": "-",
-            "toutiao": "-",
-            "baidu": "-",
-            "kuaishou": "-",
-            "jd": "-",
-            "harmony": "-",
-            "qq": "-",
-            "lark": "-",
-            "xhs": "-"
-          },
-          "quickapp": {
-            "huawei": "-",
-            "union": "-"
-          }
+        "Vue": {
+          "vue2": "n",
+          "vue3": "y"
         },
-        "uni-app-x": {
-          "web": {
-            "safari": {
-                "extVersion": "1.6.0",
-                "minVersion": "12.1"
-            },
-            "chrome": {
-                "extVersion": "1.6.0",
-                "minVersion": "73"
-            }
-          },
-          "app": {
-            "android": {
-                "extVersion": "1.6.0",
-                "minVersion": "23"
-            },
-            "ios": {
-                "extVersion": "1.6.0",
-                "minVersion": ""
-            },
-            "harmony": {
-                "extVersion": "1.6.0",
-                "minVersion": "20"
-            }
-          },
-          "mp": {
-            "weixin": "-"
-          }
+        "App": {
+          "app-android": "y",
+          "app-ios": "y",
+          "app-harmony": "y"
+        },
+        "H5-mobile": {
+          "Safari": "y",
+          "Android Browser": "y",
+          "微信浏览器(Android)": "y",
+          "QQ浏览器(Android)": "y"
+        },
+        "H5-pc": {
+          "Chrome": "y",
+          "IE": "n",
+          "Edge": "y",
+          "Firefox": "y",
+          "Safari": "y"
+        },
+        "小程序": {
+          "微信": "n",
+          "阿里": "n",
+          "百度": "n",
+          "字节跳动": "n",
+          "QQ": "n",
+          "钉钉": "n",
+          "快手": "n",
+          "飞书": "n",
+          "京东": "n"
+        },
+        "快应用": {
+          "华为": "n",
+          "联盟": "n"
         }
       }
     }
-  },
-  "dcloudext": {
-    "type": "uts-vue-component",
-    "sale": {
-      "regular": {
-        "price": "0.00"
-      },
-      "sourcecode": {
-        "price": "200.00"
-      }
-    },
-    "contact": {
-      "qq": "66274439"
-    },
-    "declaration": {
-      "ads": "无",
-      "data": "插件不采集任何数据。地图瓦片请求发送至天地图服务器(t0-7.tianditu.gov.cn)，仅用于加载地图瓦片。",
-      "permissions": "Android: INTERNET（网络）、ACCESS_NETWORK_STATE（网络状态）；iOS: 无额外权限；鸿蒙: INTERNET\n"
-    },
-    "npmurl": "",
-    "darkmode": "x",
-    "i18n": "x",
-    "widescreen": "√"
-  },
-  "engines": {
-    "HBuilderX": "^3.1.0",
-    "uni-app": "",
-    "uni-app-x": "^4.32"
-},
-"displayName": "天地图UTS原生插件（uni-app x 蒸汽模式），GPU 渲染，高性能跨平台地图，平替高德腾讯百",
-"keywords": [
-    "地图,天地图,MapKit,原生"
-],
-"repository": ""
+  }
 }

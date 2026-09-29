@@ -3,7 +3,7 @@ export type TDMapOptions = {
     latitude: number
     longitude: number
     zoom: number
-    mapType: string   // 'vec' | 'img' | 'ter'  矢量/影像/地形
+    mapType: string   // 'vec' | 'img' | 'ter' | 'blank'  矢量/影像/地形/白底（v1.9.0 新增 blank：无天地图瓦片，白底样式，鸿蒙 MapKit 无样式 JSON 回退 vec）
     // v1.5.1: Android 专用可选字段。MapLibre 官方 issue #3070：SurfaceView 在模拟器/特殊层叠场景受限时，
     // 启用 textureMode(true) 改用 TextureView 渲染（走 Android 标准 View 绘制管线，模拟器软件渲染下更流畅）。
     // 真机保持默认 false（GLSurfaceView 硬件加速性能最优）；iOS/鸿蒙/H5 忽略此字段。
@@ -288,3 +288,33 @@ export declare function addImageOverlay(params: ImageOverlayOptions): number
 export declare function updateImageOverlay(id: number, changes: ImageOverlayUpdateOptions): void
 // 点击回调（clickable=true 且可见时触发，互斥消费 mapClick；对齐 setMarkerClickCallback 模式）
 export declare function setImageOverlayClickCallback(callback: ImageOverlayClickCallback | null): void
+
+// ═══════════════════════════════════════════════════════════
+// v1.9.0 新增：GeoJSON 图层（E0，组件层编排）
+// ═══════════════════════════════════════════════════════════
+
+// GeoJSON 图层标注样式：field=properties 取地名文本的字段名；positionField=properties 取锚点
+// [lng,lat] 的字段名（缺失回退外环质心）；haloColor 支持 #rrggbb / #rrggbbaa（半透明，alpha 在后）
+export type GeoJsonLabelStyle = {
+    field: string
+    fontSize: number
+    color: string
+    haloColor: string | null
+    haloWidth: number
+    positionField: string
+}
+
+// GeoJSON 图层选项：边界描边（lineColor/lineWidth/lineDash，lineDash=null 实线）+ 填充
+// （fillColor=null 不填充；填充仅作用于外环，颜色为插件既有 #rrggbb/#aarrggbb 约定）+ 可选标注
+export type GeoJsonLayerOptions = {
+    lineColor: string
+    lineWidth: number
+    lineDash: Array<number> | null
+    fillColor: string | null
+    label: GeoJsonLabelStyle | null
+}
+
+// GeoJSON 层重放通知回调：Android/iOS/Web 样式重建（setStyle/removeStyle/switchMapType 等）完成后触发，
+// 组件层据此按快照重放已注册的 GeoJSON 层（防样式切换后图层静默丢失）；鸿蒙无样式重建不触发
+export type GeoJsonReplayCallback = () => void
+export declare function setGeoJsonReplayCallback(callback: GeoJsonReplayCallback | null): void

@@ -85,6 +85,29 @@ function allocateOverlayId(type: string, nativeRef: any): number {
     return id
 }
 
+// ══════════════════════════════════════════════
+// v1.9.0 新增：E0 GeoJSON 层重放通知（鸿蒙无样式 JSON 重建，回调仅存储永不触发）
+// ══════════════════════════════════════════════
+type GeoJsonReplayCallback = () => void
+let geoJsonReplayCallback: GeoJsonReplayCallback | null = null
+
+export function setGeoJsonReplayCallback(callback: GeoJsonReplayCallback | null): void {
+    geoJsonReplayCallback = callback
+}
+
+// v1.9.0: mapType='blank' 白底降级——华为 MapKit 无样式 JSON，无法实现白底样式，
+// 按子模块既有平台差异惯例显式上报（console.warn + onErrorCallback code=5）并回退 vec 底图
+function resolveEffectiveMapType(mapType: string): string {
+    if (mapType == 'blank') {
+        console.warn("TDTMap: 鸿蒙 MapKit 不支持白底样式（无样式 JSON），已回退 vec 底图")
+        if (onErrorCallback != null) {
+            onErrorCallback({ code: 5, message: '平台不支持：鸿蒙 MapKit 无样式 JSON，mapType=blank 已回退 vec 底图' })
+        }
+        return 'vec'
+    }
+    return mapType
+}
+
 // 从 overlayMap 中清除指定类型的所有条目
 function clearOverlayType(type: string): void {
     const keysToRemove: Array<number> = []
@@ -212,7 +235,8 @@ export function initMap(
     onReadyCallback = onReady
     onErrorCallback = onError
     currentApiKey = options.apiKey
-    currentMapType = options.mapType
+    // v1.9.0: blank 白底降级 vec（回退时机在日志/console 与 mapError 双通道提示）
+    currentMapType = resolveEffectiveMapType(options.mapType)
 
     console.log("TDTMap: initMap key=" + (options.apiKey.length > 0 ? "***" : "空") + " type=" + options.mapType)
 
@@ -275,7 +299,8 @@ export function initMap(
 
         // 预创建所有 3 类瓦片图层对（异步，addTileOverlay 返回 Promise）
         // 注意：HarmonyOS AsyncCallback 不能标记为 async，使用 .then() 处理
-        preCreateAllTileLayers(options.apiKey, options.mapType).then(() => {
+        // v1.9.0: currentMapType 已含 blank→vec 降级，勿回退用 options.mapType
+        preCreateAllTileLayers(options.apiKey, currentMapType).then(() => {
             // 地图点击事件 — HarmonyOS MapKit LatLng 使用 latitude/longitude
             const evtMgr = controller.getEventManager()
             evtMgr.on('mapClick', (latLng: mapCommon.LatLng) => {
@@ -370,8 +395,10 @@ export function initMap(
 // context7 验证：addTileOverlay (createTileLayerPair) 返回 Promise，fire-and-forget 重建不阻塞返回
 export function switchMapType(mapType: string): void {
     if (mapController == null) return
+    // v1.9.0: blank 白底降级 vec（与 initMap 同款回退）
+    const effectiveType = resolveEffectiveMapType(mapType)
     const oldType = currentMapType
-    currentMapType = mapType
+    currentMapType = effectiveType
 
     // 移除旧活跃图层
     const oldIndex = getTypeIndex(oldType)
@@ -380,15 +407,15 @@ export function switchMapType(mapType: string): void {
     allTileOverlays[oldIndex] = { base: null, label: null }
 
     // 重建目标类型图层（fire-and-forget）
-    const layers = TYPE_LAYER_MAP[mapType]
+    const layers = TYPE_LAYER_MAP[effectiveType]
     if (layers == null) return
-    addTiandituTileLayer(mapType, currentApiKey).then(() => {
-        const newIndex = getTypeIndex(mapType)
+    addTiandituTileLayer(effectiveType, currentApiKey).then(() => {
+        const newIndex = getTypeIndex(effectiveType)
         allTileOverlays[newIndex] = { base: tileOverlay, label: labelOverlay }
     }).catch((e: any) => {
         console.error("TDTMap: switchMapType 瓦片切换失败: " + (e.message ?? String(e)))
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 3, message: 'Tile layer switch failed for ' + mapType + ': ' + (e.message ?? String(e)) })
+            onErrorCallback({ code: 3, message: 'Tile layer switch failed for ' + effectiveType + ': ' + (e.message ?? String(e)) })
         }
     })
 }

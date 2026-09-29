@@ -25,6 +25,7 @@
           <button class="btn" @tap="changeMapType('vec')">矢量</button>
           <button class="btn" @tap="changeMapType('img')">影像</button>
           <button class="btn" @tap="changeMapType('ter')">地形</button>
+          <button class="btn" @tap="changeMapType('blank')">白底</button>
         </view>
 
         <text class="section-title">🔍 视野控制</text>
@@ -171,6 +172,15 @@
           <button class="btn btn-danger" @tap="demoRemoveImage">移除</button>
         </view>
 
+        <text class="section-title">🧩 GeoJSON 图层（v1.9.0 新增）</text>
+        <view class="btn-row">
+          <button class="btn" @tap="demoAddGeoPolygon">基本多边形</button>
+          <button class="btn" @tap="demoAddGeoMultiHole">多面带洞</button>
+          <button class="btn" @tap="demoHideGeoLayer">隐藏整层</button>
+          <button class="btn" @tap="demoShowGeoLayer">显示整层</button>
+          <button class="btn btn-danger" @tap="demoRemoveGeoLayer">移除整层</button>
+        </view>
+
         <text class="section-title">🗺️ 地图事件日志</text>
         <text v-if="clickLog.length > 0" class="result-text">{{ clickLog }}</text>
       </scroll-view>
@@ -180,7 +190,7 @@
 
 <script setup lang="uts">
 import { ref } from 'vue'
-import type { MapClickDetail, MapErrorDetail, MapBoundsDetail, GeocodeCallback, SearchOptions, ClusterOptions, HeatmapItem, ImageOverlayClickDetail } from '@/uni_modules/beige-tdt-map'
+import type { MapClickDetail, MapErrorDetail, MapBoundsDetail, GeocodeCallback, SearchOptions, ClusterOptions, HeatmapItem, ImageOverlayClickDetail, GeoJsonLayerOptions } from '@/uni_modules/beige-tdt-map'
 
 const mapRef = ref(null as any | null)
 const coordResult = ref('')
@@ -732,6 +742,61 @@ function demoRemoveImage(): void {
   mapRef.value?.removeOverlayById(lastImageOverlayId)
   infoText.value = '图片覆盖物 #' + lastImageOverlayId + ' 已移除'
   lastImageOverlayId = 0
+}
+
+// ── GeoJSON 图层 v1.9.0（E0）──
+// fixture 1：基本 Polygon + 标注属性（name/centroid 锚点）
+const GEOJSON_FIXTURE_POLYGON: string = '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"示例区域","centroid":[116.39,39.91]},"geometry":{"type":"Polygon","coordinates":[[[116.375,39.895],[116.405,39.895],[116.41,39.925],[116.382,39.923],[116.375,39.895]]]}}]}'
+// fixture 2：MultiPolygon（含带洞多边形）+ 属性缺失用例（第二个 feature 无 name/centroid →
+// 标注文本缺失跳过、锚点缺失回退外环质心，均为解析器设计内兜底，不抛异常）
+const GEOJSON_FIXTURE_MULTI_HOLE: string = '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"多面带洞"},"geometry":{"type":"MultiPolygon","coordinates":[[[[116.30,39.93],[116.34,39.93],[116.34,39.96],[116.30,39.96],[116.30,39.93]]],[[[116.36,39.93],[116.42,39.93],[116.42,39.965],[116.36,39.965],[116.36,39.93]],[[116.375,39.94],[116.385,39.94],[116.385,39.95],[116.375,39.95],[116.375,39.94]]]]}},{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[116.43,39.90],[116.46,39.90],[116.455,39.92],[116.43,39.918],[116.43,39.90]]]}}]}'
+let lastGeoLayerId: number = 0
+
+function demoAddGeoPolygon(): void {
+  // 市界样式用例：实线 #4475E4 宽 1 + 半透明填充（无标注——标注 fixture 在 CP-2c 后启用）
+  const opts: GeoJsonLayerOptions = {
+    lineColor: '#4475E4',
+    lineWidth: 1,
+    lineDash: null,
+    fillColor: '#4475E422',
+    label: null
+  }
+  const id = mapRef.value?.addGeoJsonLayer(GEOJSON_FIXTURE_POLYGON, opts) ?? 0
+  lastGeoLayerId = id
+  infoText.value = id > 0 ? 'GeoJSON 层 #' + id + ' 已加载（logcat 查看解析计数）' : 'GeoJSON 层加载失败（解析为空或地图未就绪）'
+}
+
+function demoAddGeoMultiHole(): void {
+  // 多面带洞 + 属性缺失：外环/内环（洞边）均描边；填充仅外环
+  const opts: GeoJsonLayerOptions = {
+    lineColor: '#009966',
+    lineWidth: 2,
+    lineDash: null,
+    fillColor: '#00996618',
+    label: null
+  }
+  const id = mapRef.value?.addGeoJsonLayer(GEOJSON_FIXTURE_MULTI_HOLE, opts) ?? 0
+  lastGeoLayerId = id
+  infoText.value = id > 0 ? 'GeoJSON 层 #' + id + ' 已加载（多面带洞 + 属性缺失兜底用例）' : 'GeoJSON 层加载失败'
+}
+
+function demoHideGeoLayer(): void {
+  if (lastGeoLayerId <= 0) { infoText.value = '请先加载 GeoJSON 图层'; return }
+  mapRef.value?.hideGeoJsonLayer(lastGeoLayerId)
+  infoText.value = 'GeoJSON 层 #' + lastGeoLayerId + ' 已隐藏'
+}
+
+function demoShowGeoLayer(): void {
+  if (lastGeoLayerId <= 0) { infoText.value = '请先加载 GeoJSON 图层'; return }
+  mapRef.value?.showGeoJsonLayer(lastGeoLayerId)
+  infoText.value = 'GeoJSON 层 #' + lastGeoLayerId + ' 已显示'
+}
+
+function demoRemoveGeoLayer(): void {
+  if (lastGeoLayerId <= 0) { infoText.value = '请先加载 GeoJSON 图层'; return }
+  mapRef.value?.removeGeoJsonLayer(lastGeoLayerId)
+  infoText.value = 'GeoJSON 层 #' + lastGeoLayerId + ' 已移除'
+  lastGeoLayerId = 0
 }
 </script>
 

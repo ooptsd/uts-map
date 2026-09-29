@@ -25,6 +25,9 @@ type MapErrorDetail = {
     message: string
 }
 
+// v1.9.0: E0 GeoJSON 层重放通知回调（与 interface.uts 声明对齐；Web 端自建类型别名惯例）
+type GeoJsonReplayCallback = () => void
+
 type MapBoundsDetail = {
     minLat: number
     minLng: number
@@ -147,6 +150,8 @@ let imageOverlays: Map<number, ImageOverlayInfo> = new Map()
 // 平行数组存添加顺序（UTS Map 迭代 API 受限，zIndex 定位/重建重放依赖，v1.8.0 同款规避）
 let imageOverlayIds: Array<number> = []
 let imageOverlayClickCallback: ImageOverlayClickCallback | null = null
+// v1.9.0: E0 GeoJSON 层重放通知（快照与编排在组件层，原生层仅负责时机通知）
+let geoJsonReplayCallback: GeoJsonReplayCallback | null = null
 
 type OverlayEntry = {
     type: string          // 'marker' | 'polygon' | 'polyline' | 'circle' | 'rectangle' | 'label' | 'image'
@@ -177,6 +182,34 @@ const LAYER_CONFIG: Map<string, TdtLayerConfig> = new Map([
 ])
 
 const TDT_API_BASE: string = 'https://api.tianditu.gov.cn'
+
+// v1.9.0: glyphs 字体端点集中常量（当前为 demotiles 占位值；⚠️ demotiles 国内不可达，
+// S0.5 端点选型后在此一行替换，三端同款常量同步修改）
+const GLYPHS_ENDPOINT: string = 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf'
+
+// v1.9.0: mapType='blank' 白底层定义（E0 配套）。空 layers 非白底（画布透明），
+// 必须显式 background #ffffff；glyphs 必须显式存在（缺 glyphs 的 text-field 图层被静默拒绝）
+function blankBackgroundLayer(): any {
+    return { id: 'tdt-bg', type: 'background', paint: { 'background-color': '#ffffff' } }
+}
+
+// 幂等确保白底层存在且可见（init blank / switchMapType 到 blank / removeStyle 恢复 blank 共用）
+function ensureBlankBgLayer(): void {
+    if (mapInstance == null) return
+    if (mapInstance.getLayer('tdt-bg') != null) {
+        try { mapInstance.setLayoutProperty('tdt-bg', 'visibility', 'visible') } catch (e: any) { /* ignore */ }
+    } else {
+        try { mapInstance.addLayer(blankBackgroundLayer()) } catch (e: any) { /* ignore */ }
+    }
+}
+
+// 隐藏白底层（blank 切回瓦片底图时；不存在时 no-op）
+function hideBlankBgLayer(): void {
+    if (mapInstance == null) return
+    if (mapInstance.getLayer('tdt-bg') != null) {
+        try { mapInstance.setLayoutProperty('tdt-bg', 'visibility', 'none') } catch (e: any) { /* ignore */ }
+    }
+}
 
 // ═══════════════════════════════════════════════════════════
 // MapLibre GL JS 动态加载
@@ -301,8 +334,10 @@ export function initMap(
             return
         }
 
-        const layerCfg = LAYER_CONFIG.get(currentMapType)
-        if (layerCfg == null) {
+        // v1.9.0: blank 白底——无天地图瓦片（无 layerCfg），初始样式直接带白底层
+        const isBlank = currentMapType == 'blank'
+        const layerCfg = isBlank ? null : LAYER_CONFIG.get(currentMapType)
+        if (!isBlank && layerCfg == null) {
             if (mapErrorCallback != null) {
                 mapErrorCallback({ code: 4, message: '未知地图类型: ' + currentMapType })
             }
@@ -314,7 +349,8 @@ export function initMap(
                 container: container,
                 // v1.7.0: glyphs 字体端点（style spec 强制校验：text-field 图层需 style 含 glyphs，
                 // 否则图层被静默拒绝，聚合数字标签不渲染——Task 10 浏览器实测发现，context7 验证）
-                style: { version: 8, glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf', sources: {}, layers: [] },
+                // v1.9.0: glyphs 抽取为 GLYPHS_ENDPOINT 集中常量；blank 时 layers 直接带白底层
+                style: { version: 8, glyphs: GLYPHS_ENDPOINT, sources: {}, layers: isBlank ? [blankBackgroundLayer()] : [] },
                 center: [currentLng, currentLat],
                 zoom: currentZoom,
                 maxZoom: 18,
@@ -323,7 +359,9 @@ export function initMap(
             })
 
             map.on('load', () => {
-                addTdtBaseLayers(map, layerCfg)
+                if (!isBlank) {
+                    addTdtBaseLayers(map, layerCfg)
+                }
 
                 if (mapReadyCallback != null) {
                     mapReadyCallback()
@@ -466,11 +504,32 @@ export function fitBounds(minLat: number, minLng: number, maxLat: number, maxLng
 
 export function switchMapType(mapType: string): void {
     if (mapInstance == null) return
+    // v1.9.0: blank——隐藏天地图瓦片层并显示白底层（无样式重建，层引用保留）
+    if (mapType == 'blank') {
+        currentMapType = 'blank'
+        try {
+            if (mapInstance.getLayer('tdt-base-layer') != null) {
+                mapInstance.setLayoutProperty('tdt-base-layer', 'visibility', 'none')
+            }
+            if (mapInstance.getLayer('tdt-anno-layer') != null) {
+                mapInstance.setLayoutProperty('tdt-anno-layer', 'visibility', 'none')
+            }
+        } catch (e: any) {
+            console.error('TDTMap Web: switchMapType blank 失败', e)
+        }
+        ensureBlankBgLayer()
+        return
+    }
     const cfg = LAYER_CONFIG.get(mapType)
     if (cfg == null) return
     currentMapType = mapType
-
+    hideBlankBgLayer()
     try {
+        // blank 起底时瓦片 source 未创建，需补建（含注记层）；常规切换仅换 tiles 并确保可见
+        if (mapInstance.getSource('tdt-base') == null) {
+            addTdtBaseLayers(mapInstance, cfg)
+            return
+        }
         const baseSrc = mapInstance.getSource('tdt-base')
         if (baseSrc != null) {
             baseSrc.setTiles([buildTileUrl(cfg.map, currentApiKey)])
@@ -479,7 +538,13 @@ export function switchMapType(mapType: string): void {
         if (annoSrc != null) {
             annoSrc.setTiles([buildTileUrl(cfg.anno, currentApiKey)])
         }
-    } catch (e) {
+        if (mapInstance.getLayer('tdt-base-layer') != null) {
+            mapInstance.setLayoutProperty('tdt-base-layer', 'visibility', 'visible')
+        }
+        if (mapInstance.getLayer('tdt-anno-layer') != null) {
+            mapInstance.setLayoutProperty('tdt-anno-layer', 'visibility', 'visible')
+        }
+    } catch (e: any) {
         console.error('TDTMap Web: switchMapType 失败', e)
     }
 }
@@ -1294,6 +1359,11 @@ function rebuildUserLayersAfterStyle(): void {
             addImageOverlayInternal(savedImgs[i].params, savedImgs[i].id)
         }
     }
+    // v1.9.0: E0 GeoJSON 层重放通知（组件层持有 geojson/options 快照与编排逻辑，原生层只负责通知时机）
+    const replayCb = geoJsonReplayCallback
+    if (replayCb != null) {
+        replayCb()
+    }
 }
 
 // v1.8.0: 样式完成监听注册（保证任意时刻只有一个待触发监听，
@@ -1338,12 +1408,21 @@ export function setStyle(styleJson: string): void {
 
 export function removeStyle(): void {
     if (mapInstance == null) return
-    const cfg = LAYER_CONFIG.get(currentMapType)
-    if (cfg == null) return
-    mapInstance.setStyle({ version: 8, glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf', sources: {}, layers: [] })
+    // v1.9.0: blank 底图恢复时初始样式直接带白底层；瓦片底图恢复空 layers 后重建天地图层
+    const isBlankRestore = currentMapType == 'blank'
+    const cfg = isBlankRestore ? null : LAYER_CONFIG.get(currentMapType)
+    if (!isBlankRestore && cfg == null) return
+    mapInstance.setStyle({
+        version: 8,
+        glyphs: GLYPHS_ENDPOINT,
+        sources: {},
+        layers: isBlankRestore ? [blankBackgroundLayer()] : []
+    })
     registerStyleLoadHandler((): void => {
         if (mapInstance == null) return
-        addTdtBaseLayers(mapInstance, cfg)
+        if (!isBlankRestore && cfg != null) {
+            addTdtBaseLayers(mapInstance, cfg)
+        }
         rebuildUserLayersAfterStyle()
     })
 }
@@ -1857,4 +1936,9 @@ export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOption
 export function setImageOverlayClickCallback(callback: ImageOverlayClickCallback | null): void {
     // 仅更新回调引用；命中检测在 initMap 注册的单一 click 监听内执行（与 Android Priority 链同源）
     imageOverlayClickCallback = callback
+}
+
+// v1.9.0: E0 GeoJSON 层重放通知注册（触发点：rebuildUserLayersAfterStyle 末尾）
+export function setGeoJsonReplayCallback(callback: GeoJsonReplayCallback | null): void {
+    geoJsonReplayCallback = callback
 }

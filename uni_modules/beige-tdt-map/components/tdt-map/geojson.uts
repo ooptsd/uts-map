@@ -1,0 +1,194 @@
+/**
+ * E0.1 GeoJSON 解析器（v1.9.0 新增）
+ *
+ * 纯 UTS 纯函数、零平台 API：geojson 字符串 → 结构化要素列表，
+ * 供 tdt-map.uvue 编排器（E0.2）循环调 styled/draw 原语渲染。
+ *
+ * 支持几何：FeatureCollection / Feature / Polygon / MultiPolygon /
+ * LineString / MultiLineString（顶层裸 geometry 也接受，无 properties）。
+ * Point/GeometryCollection 等边界图层用不到的类型显式跳过。
+ *
+ * UTS 约束（对照 AGENTS.md §8）：
+ * - 无 undefined，可空一律 null；条件判断显式布尔
+ * - 对象字面量用命名 type 承接；嵌套类型单独声明
+ * - JSON.parse 产物为 UTSJSONObject，取值收敛在本文件（[] 下标 + as 转换，
+ *   官方文档 buildin-object-api/json：全平台通用方式）
+ * - 坏数据不抛异常：非法 JSON / 非法几何 / 属性类型不符一律跳过并记日志
+ */
+
+// 坐标点（与 tdt-map.uvue 组件层 draw* 系列入参同形态；
+// UTS 名义类型系统下跨文件复用同一声明，禁止在组件层再行重复定义）
+export type GeoLatLng = { latitude: number, longitude: number }
+
+// 解析产物：一个要素 = 若干闭合环（外环在前、内环/洞在后，均需描边）+ 可选标注
+// label：properties[labelField] 的文本值，缺失为 null（调用方跳过标注）
+// anchorLat/anchorLng：properties[positionField] 的 [lng,lat] 锚点，
+//   缺失时回退外环质心（顶点算术平均），由本解析器统一兜底
+export type GeoParsedFeature = {
+    rings: Array<Array<GeoLatLng>>
+    label: string | null
+    anchorLat: number | null
+    anchorLng: number | null
+}
+
+// 环顶点算术平均质心（凹多边形可能略偏；生产数据建议 properties 预置 centroid 锚点）
+function ringCentroid(ring: Array<GeoLatLng>): GeoLatLng {
+    if (ring.length == 0) return { latitude: 0.0, longitude: 0.0 }
+    let sumLat = 0.0
+    let sumLng = 0.0
+    for (let i = 0; i < ring.length; i++) {
+        sumLat += ring[i].latitude
+        sumLng += ring[i].longitude
+    }
+    return { latitude: sumLat / ring.length, longitude: sumLng / ring.length }
+}
+
+// 单个环（[[lng,lat],...]）→ 坐标点数组；点数不足 2 视为非法返回 null
+function parseRing(raw: any): Array<GeoLatLng> | null {
+    const arr = raw as Array<any>
+    const pts: Array<GeoLatLng> = []
+    for (let i = 0; i < arr.length; i++) {
+        const pt = arr[i] as Array<number>
+        if (pt.length >= 2) {
+            // GeoJSON 坐标序为 [longitude, latitude]
+            pts.push({ latitude: pt[1], longitude: pt[0] })
+        }
+    }
+    if (pts.length < 2) return null
+    return pts
+}
+
+// Polygon.coordinates（环数组）逐环解析追加；洞（内环）同样产出（洞边也是界线）
+function parseRingsFromCoordinates(raw: any, out: Array<Array<GeoLatLng>>): void {
+    const rings = raw as Array<any>
+    for (let i = 0; i < rings.length; i++) {
+        const ring = parseRing(rings[i])
+        if (ring != null) out.push(ring)
+    }
+}
+
+// MultiPolygon.coordinates（[[ring...],[ring...]]）展平为环列表
+function parseMultiPolygon(raw: any, out: Array<Array<GeoLatLng>>): void {
+    const polys = raw as Array<any>
+    for (let i = 0; i < polys.length; i++) {
+        parseRingsFromCoordinates(polys[i], out)
+    }
+}
+
+// properties 字符串读取（类型不符返回 null，不中断整个要素解析）
+function readStringProp(props: UTSJSONObject, key: string): string | null {
+    try {
+        const v = props[key]
+        if (v == null) return null
+        return v as string
+    } catch (e: any) {
+        return null
+    }
+}
+
+// properties 锚点读取（[lng,lat] 数组；类型不符返回 null）
+function readLngLatProp(props: UTSJSONObject, key: string): Array<number> | null {
+    try {
+        const v = props[key]
+        if (v == null) return null
+        return v as Array<number>
+    } catch (e: any) {
+        return null
+    }
+}
+
+// 几何对象应用到要素；返回 false 表示无可用环（跳过该要素）
+function applyGeometry(geo: UTSJSONObject, f: GeoParsedFeature): boolean {
+    const t = geo["type"]
+    const typeStr = t != null ? (t as string) : ''
+    const coords = geo["coordinates"]
+    if (coords == null) return false
+    if (typeStr == 'Polygon') {
+        parseRingsFromCoordinates(coords, f.rings)
+    } else if (typeStr == 'MultiPolygon') {
+        parseMultiPolygon(coords, f.rings)
+    } else if (typeStr == 'LineString') {
+        const ring = parseRing(coords)
+        if (ring != null) f.rings.push(ring)
+    } else if (typeStr == 'MultiLineString') {
+        parseRingsFromCoordinates(coords, f.rings)
+    } else {
+        // Point / GeometryCollection 等：E0 边界图层不需要，显式跳过
+        return false
+    }
+    return f.rings.length > 0
+}
+
+// 锚点兜底：positionField 缺失时取外环质心
+function fallbackAnchor(f: GeoParsedFeature): void {
+    if (f.anchorLat == null || f.anchorLng == null) {
+        if (f.rings.length > 0) {
+            const c = ringCentroid(f.rings[0])
+            f.anchorLat = c.latitude
+            f.anchorLng = c.longitude
+        }
+    }
+}
+
+// 单个 Feature 对象解析（properties + geometry）
+function parseOneFeature(raw: any, labelField: string, positionField: string, out: Array<GeoParsedFeature>): void {
+    try {
+        const obj = raw as UTSJSONObject
+        const f: GeoParsedFeature = { rings: [], label: null, anchorLat: null, anchorLng: null }
+        const props = obj["properties"] as UTSJSONObject | null
+        if (props != null && labelField.length > 0) {
+            f.label = readStringProp(props, labelField)
+        }
+        if (props != null && positionField.length > 0) {
+            const anchor = readLngLatProp(props, positionField)
+            if (anchor != null && anchor.length >= 2) {
+                f.anchorLng = anchor[0]
+                f.anchorLat = anchor[1]
+            }
+        }
+        const geo = obj["geometry"] as UTSJSONObject | null
+        if (geo == null) return
+        if (applyGeometry(geo, f)) {
+            fallbackAnchor(f)
+            out.push(f)
+        }
+    } catch (e: any) {
+        console.error('TDTMap GeoJSON: 要素解析失败，已跳过: ' + (e.message ?? ''))
+    }
+}
+
+/**
+ * 解析 GeoJSON 字符串为要素列表（纯函数，坏输入返回空数组不抛异常）
+ * labelField：properties 中标注文本字段名（空串表示不取标注）
+ * positionField：properties 中锚点字段名（值为 [lng,lat]，空串表示不取锚点）
+ */
+export function parseGeoJsonFeatures(geojson: string, labelField: string, positionField: string): Array<GeoParsedFeature> {
+    const out: Array<GeoParsedFeature> = []
+    if (geojson.length == 0) return out
+    try {
+        const parsed = JSON.parse(geojson)
+        if (parsed == null) return out
+        const rootType = parsed["type"]
+        const typeStr = rootType != null ? (rootType as string) : ''
+        if (typeStr == 'FeatureCollection') {
+            const features = parsed["features"] as Array<any>
+            for (let i = 0; i < features.length; i++) {
+                parseOneFeature(features[i], labelField, positionField, out)
+            }
+        } else if (typeStr == 'Feature') {
+            parseOneFeature(parsed, labelField, positionField, out)
+        } else if (typeStr == 'Polygon' || typeStr == 'MultiPolygon' || typeStr == 'LineString' || typeStr == 'MultiLineString') {
+            // 顶层裸 geometry（无 properties，无标注）
+            const f: GeoParsedFeature = { rings: [], label: null, anchorLat: null, anchorLng: null }
+            if (applyGeometry(parsed, f)) {
+                fallbackAnchor(f)
+                out.push(f)
+            }
+        } else {
+            console.error('TDTMap GeoJSON: 不支持的顶层类型: ' + typeStr)
+        }
+    } catch (e: any) {
+        console.error('TDTMap GeoJSON: 解析失败: ' + (e.message ?? ''))
+    }
+    return out
+}

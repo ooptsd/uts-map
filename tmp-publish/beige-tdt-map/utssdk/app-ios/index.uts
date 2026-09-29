@@ -20,7 +20,9 @@ import { UIEdgeInsets } from "UIKit"
 import { NSURL, NSExpression, NSBundle, NSString } from "Foundation"
 // v1.9.0: 图片覆盖物（MLNImageSource + MLNRasterStyleLayer）
 import { MLNImageSource } from "MapLibre"
-import { TDMapOptions, MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MapClickCallback, MapReadyCallback, MapErrorCallback, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickCallback } from '../interface.uts'
+// v1.9.0: mapType='blank' 白底层（E0 配套）
+import { MLNBackgroundStyleLayer } from "MapLibre"
+import { TDMapOptions, MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MapClickCallback, MapReadyCallback, MapErrorCallback, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickCallback, GeoJsonReplayCallback } from '../interface.uts'
 
 // ⚠️ 天地图 Key 类型说明（自新系统升级后严格区分，混用会导致瓦片不显示）:
 //   - "浏览器端" key：校验 Referer 头 + 域名白名单 → 原生 App 不发送浏览器 Referer → 403 被拒 → 灰白背景
@@ -60,6 +62,9 @@ let imageOverlayExt = new Map<number, ImageOverlayExt>()
 // 平行数组存添加顺序（zIndex 定位/重建重放；iOS 无公开的 style 有序层列表，层序由自身插入逻辑维护）
 let imageOverlayIds: Array<number> = []
 let imageOverlayClickCallback: ImageOverlayClickCallback | null = null
+
+// v1.9.0: E0 GeoJSON 层重放通知（快照与编排在组件层，原生层仅负责时机通知）
+let geoJsonReplayCallback: GeoJsonReplayCallback | null = null
 
 let markerClickCallback: MarkerClickCallback | null = null
 let mapLongClickCallback: MapLongClickCallback | null = null
@@ -101,6 +106,29 @@ function buildTileURLsArray(layerType: string, apiKey: string): Array<string> {
     return urls
 }
 
+// v1.9.0: mapType='blank' 白底层（E0 配套）。空样式画布非白底，必须显式 background #ffffff。
+// 幂等：层已存在时仅恢复可见（blank ↔ vec/img/ter 切换复用）
+function ensureBlankBackgroundLayer(mapView: MLNMapView): void {
+    const style = mapView.style
+    if (style == null) return
+    const existing = style.layerWithIdentifier("tdt-bg-layer")
+    if (existing != null) {
+        existing.isVisible = true
+        return
+    }
+    const layer = new MLNBackgroundStyleLayer("tdt-bg-layer")
+    layer.backgroundColor = NSExpression(forConstantValue: UIColor.colorWithRed(1.0, 1.0, 1.0, 1.0))
+    style.addLayer(layer)
+}
+
+// 隐藏白底层（blank 切回 vec/img/ter 时调用；层不存在时 no-op）
+function hideBlankBackgroundLayer(mapView: MLNMapView): void {
+    const existing = mapView.style?.layerWithIdentifier("tdt-bg-layer")
+    if (existing != null) {
+        existing.isVisible = false
+    }
+}
+
 // 插件内置空白样式（替代 demotiles.maplibre.org，该域名在国内被墙）
 // style.json 位于 utssdk/app-ios/Resources/，打包时由 uni-app x 拷入主 Bundle
 // 如果 Resources/style.json 被打包工具遗漏，使用 inline data URL 空白样式作为兜底
@@ -131,10 +159,15 @@ class TDTMapDelegate implements MLNMapViewDelegate {
         // mode 1 不重建天底图（防天地图瓦片盖住用户样式——若不拦截，setStyle 后
         // 本回调会无条件加回天地图三层，用户自定义样式被底图覆盖，属真 bug）
         if (styleRebuildMode == 0) {
-            // 预创建所有图层对（vec/img/ter），非活跃图层设为不可见
-            addTiandituTileLayer(mapView, 'vec', this.opts.apiKey, this.opts.mapType == 'vec' ? 'visible' : 'none')
-            addTiandituTileLayer(mapView, 'img', this.opts.apiKey, this.opts.mapType == 'img' ? 'visible' : 'none')
-            addTiandituTileLayer(mapView, 'ter', this.opts.apiKey, this.opts.mapType == 'ter' ? 'visible' : 'none')
+            // v1.9.0: blank 白底——不加载天地图瓦片（vec 注记与插件地名叠影问题随之消失）
+            if (this.opts.mapType == 'blank') {
+                ensureBlankBackgroundLayer(mapView)
+            } else {
+                // 预创建所有图层对（vec/img/ter），非活跃图层设为不可见
+                addTiandituTileLayer(mapView, 'vec', this.opts.apiKey, this.opts.mapType == 'vec' ? 'visible' : 'none')
+                addTiandituTileLayer(mapView, 'img', this.opts.apiKey, this.opts.mapType == 'img' ? 'visible' : 'none')
+                addTiandituTileLayer(mapView, 'ter', this.opts.apiKey, this.opts.mapType == 'ter' ? 'visible' : 'none')
+            }
 
             // 设置初始视角（CLLocationCoordinate2D 是 C 结构体，必须用 Make 函数构造）
             const center = CLLocationCoordinate2DMake(this.opts.latitude, this.opts.longitude)
@@ -147,9 +180,14 @@ class TDTMapDelegate implements MLNMapViewDelegate {
         }
         if (styleRebuildMode == 2) {
             // removeStyle：空样式已加载，重建天地图底图三层（仅当前类型可见）
-            addTiandituTileLayer(mapView, 'vec', currentApiKey, currentMapType == 'vec' ? 'visible' : 'none')
-            addTiandituTileLayer(mapView, 'img', currentApiKey, currentMapType == 'img' ? 'visible' : 'none')
-            addTiandituTileLayer(mapView, 'ter', currentApiKey, currentMapType == 'ter' ? 'visible' : 'none')
+            if (currentMapType == 'blank') {
+                // v1.9.0: blank 底图恢复白底层
+                ensureBlankBackgroundLayer(mapView)
+            } else {
+                addTiandituTileLayer(mapView, 'vec', currentApiKey, currentMapType == 'vec' ? 'visible' : 'none')
+                addTiandituTileLayer(mapView, 'img', currentApiKey, currentMapType == 'img' ? 'visible' : 'none')
+                addTiandituTileLayer(mapView, 'ter', currentApiKey, currentMapType == 'ter' ? 'visible' : 'none')
+            }
         }
         // mode 1/2 均重建用户数据层
         rebuildUserLayersAfterStyle()
@@ -690,16 +728,32 @@ export function clearOverlays(): void {
 
 export function switchMapType(mapType: string): void {
     if (mapView == null) return
+    const mv = mapView
     currentMapType = mapType
+    // v1.9.0: blank——隐藏全部天地图层并显示白底层（复用预创建图层，零样式重建）
+    if (mapType == 'blank') {
+        const types0 = ["vec", "img", "ter"]
+        for (let i = 0; i < types0.length; i++) {
+            const type = types0[i]
+            const baseLayer0 = mv.style?.layerWithIdentifier("tdt-base-" + type + "-layer")
+            if (baseLayer0 != null) baseLayer0.isVisible = false
+            const labelLayer0 = mv.style?.layerWithIdentifier("tdt-label-" + type + "-layer")
+            if (labelLayer0 != null) labelLayer0.isVisible = false
+        }
+        ensureBlankBackgroundLayer(mv)
+        return
+    }
     const types = ["vec", "img", "ter"]
     for (let i = 0; i < types.length; i++) {
         const type = types[i]
         const isVisible = type === mapType
-        const baseLayer = mapView.style?.layerWithIdentifier("tdt-base-" + type + "-layer")
+        const baseLayer = mv.style?.layerWithIdentifier("tdt-base-" + type + "-layer")
         if (baseLayer != null) baseLayer.isVisible = isVisible
-        const labelLayer = mapView.style?.layerWithIdentifier("tdt-label-" + type + "-layer")
+        const labelLayer = mv.style?.layerWithIdentifier("tdt-label-" + type + "-layer")
         if (labelLayer != null) labelLayer.isVisible = isVisible
     }
+    // blank 切回瓦片底图时隐藏白底层
+    hideBlankBackgroundLayer(mv)
 }
 
 export function snapshot(callback: (data: ArrayBuffer) => void): void {
@@ -1546,6 +1600,11 @@ function rebuildUserLayersAfterStyle(): void {
             }
         }
     }
+    // v1.9.0: E0 GeoJSON 层重放通知（组件层持有 geojson/options 快照与编排逻辑，原生层只负责通知时机）
+    const replayCb = geoJsonReplayCallback
+    if (replayCb != null) {
+        replayCb()
+    }
 }
 
 // context7: MLNMapView.h 官方源码——styleJSON 属性"Setting this property results in an asynchronous
@@ -2077,4 +2136,10 @@ export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOption
 export function setImageOverlayClickCallback(callback: ImageOverlayClickCallback | null): void {
     // 仅更新回调引用；命中检测在 initMap 注册的 tapGesture 闭包内执行（与 Android Priority 链同源）
     imageOverlayClickCallback = callback
+}
+
+// v1.9.0: E0 GeoJSON 层重放通知注册（触发点：rebuildUserLayersAfterStyle 末尾）
+@UTSJS.keepAlive
+export function setGeoJsonReplayCallback(callback: GeoJsonReplayCallback | null): void {
+    geoJsonReplayCallback = callback
 }

@@ -127,10 +127,14 @@ import {
   // v1.9.0: 图片覆盖物（重命名导入避免与下方同名 setup 函数冲突）
   addImageOverlay as nativeAddImageOverlay,
   updateImageOverlay as nativeUpdateImageOverlay,
-  setImageOverlayClickCallback as nativeSetImageOverlayClickCallback
+  setImageOverlayClickCallback as nativeSetImageOverlayClickCallback,
+  // v1.9.0: E0 GeoJSON 层重放通知（样式重建后由原生层触发组件层重放）
+  setGeoJsonReplayCallback as nativeSetGeoJsonReplayCallback
 } from '@/uni_modules/beige-tdt-map'
 import globalConfig from '@/uni_modules/beige-tdt-map/config'
-import type { MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickDetail } from '@/uni_modules/beige-tdt-map'
+import type { MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickDetail, GeoJsonLayerOptions } from '@/uni_modules/beige-tdt-map'
+// v1.9.0: E0.1 GeoJSON 解析器（同目录纯 UTS 文件，零平台 API）
+import { parseGeoJsonFeatures, type GeoLatLng, type GeoParsedFeature } from './geojson.uts'
 
 const props = defineProps({
   apiKey: { type: String, default: '' },
@@ -382,6 +386,11 @@ function onNativeViewInit(e: UniNativeViewInitEvent): void {
   nativeSetImageOverlayClickCallback((detail: ImageOverlayClickDetail) => {
     emit('imageOverlayClick', detail)
   })
+
+  // v1.9.0: 注册 GeoJSON 层重放回调（Android/iOS 样式重建后由原生层触发）
+  nativeSetGeoJsonReplayCallback((): void => {
+    replayGeoJsonLayers()
+  })
 }
 
 function moveToCenter(lat: number, lng: number): void { setCenter(lat, lng) }
@@ -392,9 +401,7 @@ function changeMapType(mapType: string): void { switchMapType(mapType) }
 function getCurrentCenter(): MapClickDetail { return getCenter() }
 function getCurrentZoom(): number { return getZoom() }
 function fitToBounds(minLat: number, minLng: number, maxLat: number, maxLng: number, padding: number): void { fitBounds(minLat, minLng, maxLat, maxLng, padding) }
-// 对外接受 {latitude, longitude} 数组，内部映射为接口契约的 MapClickDetail
-type LatLng = { latitude: number, longitude: number }
-function drawPolygon(points: Array<LatLng>, color: string, fillColor: string): number {
+function drawPolygon(points: Array<GeoLatLng>, color: string, fillColor: string): number {
   const detail: Array<MapClickDetail> = []
   for (let i = 0; i < points.length; i++) {
     detail.push({ lat: points[i].latitude, lng: points[i].longitude })
@@ -438,7 +445,7 @@ function setDragEnabled(enabled: boolean): void { enableDrag(enabled) }
 function setMapMaxBounds(minLat: number | null, minLng: number | null, maxLat: number | null, maxLng: number | null): void { setMaxBounds(minLat, minLng, maxLat, maxLng) }
 function getCurrentBounds(): MapBoundsDetail { return getBounds() }
 function convertGcj02ToWgs84(lat: number, lng: number): MapClickDetail { return gcj02ToWgs84(lat, lng) }
-function drawPolyline(points: Array<LatLng>, color: string, width: number): number {
+function drawPolyline(points: Array<GeoLatLng>, color: string, width: number): number {
   const detail: Array<MapClickDetail> = []
   for (let i = 0; i < points.length; i++) {
     detail.push({ lat: points[i].latitude, lng: points[i].longitude })
@@ -448,14 +455,18 @@ function drawPolyline(points: Array<LatLng>, color: string, width: number): numb
 function drawCircle(lat: number, lng: number, radius: number, color: string, fillColor: string): number { return addCircle(lat, lng, radius, color, fillColor) }
 function drawRectangle(minLat: number, minLng: number, maxLat: number, maxLng: number, color: string, fillColor: string): number { return addRectangle(minLat, minLng, maxLat, maxLng, color, fillColor) }
 function drawLabel(lat: number, lng: number, text: string): number { return addLabel(lat, lng, text) }
-function batchMarkers(markers: Array<LatLng>): Array<number> {
+function batchMarkers(markers: Array<GeoLatLng>): Array<number> {
   const detail: Array<MapClickDetail> = []
   for (let i = 0; i < markers.length; i++) {
     detail.push({ lat: markers[i].latitude, lng: markers[i].longitude })
   }
   return setMarkers(detail)
 }
-function clearAllOverlays(): void { clearOverlays() }
+function clearAllOverlays(): void {
+  clearOverlays()
+  // v1.9.0: GeoJSON 层注册表纳入清理链（子覆盖物已随 clearOverlays 移除，仅清层状态）
+  clearGeoJsonLayerRegistry()
+}
 
 // ── 新增：覆盖物单个操作 ──
 function removeOverlayById(id: number): void { removeOverlay(id) }
@@ -465,7 +476,7 @@ function hideOverlayById(id: number): void { hideOverlay(id) }
 // ── 新增：地图工具 ──
 function doCheckResize(): void { checkResize() }
 function doPlanBy(x: number, y: number): void { planBy(x, y) }
-function setViewportPoints(points: Array<LatLng>): void {
+function setViewportPoints(points: Array<GeoLatLng>): void {
   const detail: Array<MapClickDetail> = []
   for (let i = 0; i < points.length; i++) {
     detail.push({ lat: points[i].latitude, lng: points[i].longitude })
@@ -604,6 +615,148 @@ function isSupportCanvas(): boolean { return nativeIsSupportCanvas() }
 function addImageOverlay(params: ImageOverlayOptions): number { return nativeAddImageOverlay(params) }
 function updateImageOverlay(id: number, changes: ImageOverlayUpdateOptions): void { nativeUpdateImageOverlay(id, changes) }
 
+// ═══ v1.9.0 新增：E0.2 GeoJSON 图层编排器 ═══
+// 层注册表：Map 迭代顺序不保证，平行数组 geoJsonLayerIds 存添加顺序（重放按此顺序，层叠放=创建顺序后建在上）
+let geoJsonLayerIdCounter: number = 0
+let geoJsonLayerIds: Array<number> = []
+let geoJsonLayerChildren = new Map<number, Array<number>>()          // 层 ID → 子覆盖物 ID 列表
+let geoJsonLayerSources = new Map<number, string>()                  // 层 ID → geojson 文本快照（重放依据）
+let geoJsonLayerOptionsMap = new Map<number, GeoJsonLayerOptions>()  // 层 ID → options 快照（重放依据）
+let geoJsonLayerVisible = new Map<number, boolean>()                 // 层 ID → 可见性（重放后恢复隐藏态）
+
+// 内部编排：解析产物 → 逐 feature 逐 ring 调 draw 原语。
+// 描边（CP-2a 阶段为 drawPolyline 实线形态；CP-2b 起改走 drawStyledPolyline 承接 lineDash/opacity）；
+// 填充仅作用外环（fill 自带 outline 传 fillColor 隐形化，描边统一由描边原语负责、线宽可控）；
+// 标注分支 CP-2a 暂不渲染（options.label 已完整解析入快照库，CP-2c 完成 drawStyledText 后接线）
+function buildGeoJsonOverlays(features: Array<GeoParsedFeature>, options: GeoJsonLayerOptions): Array<number> {
+  const ids: Array<number> = []
+  let ringCount = 0
+  // 局部变量承接可空字段（判空后传参，规避 smart cast 不确定性）
+  const fillColor = options.fillColor
+  for (let i = 0; i < features.length; i++) {
+    const f = features[i]
+    if (fillColor != null && f.rings.length > 0 && f.rings[0].length >= 3) {
+      const fillId = drawPolygon(f.rings[0], fillColor, fillColor)
+      if (fillId > 0) ids.push(fillId)
+    }
+    for (let j = 0; j < f.rings.length; j++) {
+      ringCount++
+      const strokeId = drawPolyline(f.rings[j], options.lineColor, options.lineWidth)
+      if (strokeId > 0) ids.push(strokeId)
+    }
+    // 标注分支：CP-2c 接线（options.label 非空且 f.label 非空且锚点非空时 drawStyledText 于 f.anchor）
+  }
+  console.log('TDTMap: GeoJSON 编排完成 feature=' + features.length + ' ring=' + ringCount + ' 子覆盖物=' + ids.length)
+  return ids
+}
+
+// 添加 GeoJSON 图层：解析一次 → 循环调 draw 原语 → 返回层 ID（0=失败）
+function addGeoJsonLayer(geojson: string, options: GeoJsonLayerOptions): number {
+  if (!isMapReady.value) {
+    console.error('TDTMap: 地图未就绪，无法添加 GeoJSON 图层')
+    return 0
+  }
+  // 局部变量承接可空字段（判空后取值，规避 smart cast 不确定性；panToLocation 先例）
+  const labelOpt = options.label
+  const labelField = labelOpt != null ? labelOpt.field : ''
+  const positionField = labelOpt != null ? labelOpt.positionField : ''
+  const features = parseGeoJsonFeatures(geojson, labelField, positionField)
+  if (features.length == 0) {
+    console.error('TDTMap: GeoJSON 解析结果为空（格式非法或无支持的几何类型）')
+    return 0
+  }
+  const childIds = buildGeoJsonOverlays(features, options)
+  if (childIds.length == 0) return 0
+  geoJsonLayerIdCounter++
+  const layerId = geoJsonLayerIdCounter
+  geoJsonLayerIds.push(layerId)
+  geoJsonLayerChildren.set(layerId, childIds)
+  geoJsonLayerSources.set(layerId, geojson)
+  geoJsonLayerOptionsMap.set(layerId, options)
+  geoJsonLayerVisible.set(layerId, true)
+  return layerId
+}
+
+// 移除整层（逐个移除子覆盖物并清注册表）
+function removeGeoJsonLayer(layerId: number): void {
+  const ids = geoJsonLayerChildren.get(layerId)
+  if (ids != null) {
+    for (let i = 0; i < ids.length; i++) {
+      removeOverlayById(ids[i])
+    }
+  }
+  geoJsonLayerChildren.delete(layerId)
+  geoJsonLayerSources.delete(layerId)
+  geoJsonLayerOptionsMap.delete(layerId)
+  geoJsonLayerVisible.delete(layerId)
+  geoJsonLayerIds = geoJsonLayerIds.filter(x => x != layerId)
+}
+
+// 整层显示
+function showGeoJsonLayer(layerId: number): void {
+  const ids = geoJsonLayerChildren.get(layerId)
+  if (ids == null) return
+  for (let i = 0; i < ids.length; i++) {
+    showOverlayById(ids[i])
+  }
+  geoJsonLayerVisible.set(layerId, true)
+}
+
+// 整层隐藏
+function hideGeoJsonLayer(layerId: number): void {
+  const ids = geoJsonLayerChildren.get(layerId)
+  if (ids == null) return
+  for (let i = 0; i < ids.length; i++) {
+    hideOverlayById(ids[i])
+  }
+  geoJsonLayerVisible.set(layerId, false)
+}
+
+// 样式重建重放（Android/iOS/Web rebuildUserLayersAfterStyle 末尾经回调触发；
+// 仿图片覆盖物"快照 → 样式就绪 → 重建 → 恢复隐藏态"模式；重放后子覆盖物 ID 更新入注册表）
+function replayGeoJsonLayers(): void {
+  if (geoJsonLayerIds.length == 0) return
+  const layerIds = geoJsonLayerIds.slice()
+  let replayed = 0
+  for (let i = 0; i < layerIds.length; i++) {
+    const layerId = layerIds[i]
+    const src = geoJsonLayerSources.get(layerId)
+    const opt = geoJsonLayerOptionsMap.get(layerId)
+    if (src == null || opt == null) continue
+    // 旧子覆盖物逐个移除（style 层系已随旧样式失效；annotation 体系跨样式存活的端则真实移除）
+    const oldIds = geoJsonLayerChildren.get(layerId)
+    if (oldIds != null) {
+      for (let j = 0; j < oldIds.length; j++) {
+        removeOverlayById(oldIds[j])
+      }
+    }
+    const labelOpt = opt.label
+    const labelField = labelOpt != null ? labelOpt.field : ''
+    const positionField = labelOpt != null ? labelOpt.positionField : ''
+    const features = parseGeoJsonFeatures(src, labelField, positionField)
+    const childIds = buildGeoJsonOverlays(features, opt)
+    geoJsonLayerChildren.set(layerId, childIds)
+    // 隐藏过的层不能因重建而复现
+    const visibleSnap = geoJsonLayerVisible.get(layerId)
+    if (visibleSnap != null && !visibleSnap) {
+      for (let k = 0; k < childIds.length; k++) {
+        hideOverlayById(childIds[k])
+      }
+    }
+    replayed++
+  }
+  console.log('TDTMap: GeoJSON 层重放完成（' + replayed + '/' + layerIds.length + ' 层）')
+}
+
+// 清理链挂接：clearAllOverlays 时清空层注册表（原生 clearOverlays 已移除全部子覆盖物）
+function clearGeoJsonLayerRegistry(): void {
+  geoJsonLayerIds = []
+  geoJsonLayerChildren.clear()
+  geoJsonLayerSources.clear()
+  geoJsonLayerOptionsMap.clear()
+  geoJsonLayerVisible.clear()
+}
+
 // ── v1.4.0 新增：地图交互增强 ──
 function setMapBearing(bearing: number): void { setBearing(bearing) }
 function setMapTilt(tilt: number): void { setTilt(tilt) }
@@ -667,6 +820,11 @@ onMounted(() => {
   nativeSetImageOverlayClickCallback((detail: ImageOverlayClickDetail) => {
     emit('imageOverlayClick', detail)
   })
+
+  // v1.9.0: 注册 GeoJSON 层重放回调（Web setStyle/removeStyle 后由原生层触发）
+  nativeSetGeoJsonReplayCallback((): void => {
+    replayGeoJsonLayers()
+  })
 })
 // #endif
 
@@ -690,6 +848,9 @@ onMounted(() => {
 onUnmounted(() => {
   onPause()
   destroyMap()
+  // v1.9.0: 注销 GeoJSON 重放回调并清层注册表（防多实例叠加时旧回调持引用、旧层状态残留）
+  nativeSetGeoJsonReplayCallback(null)
+  clearGeoJsonLayerRegistry()
 })
 
 defineExpose({
@@ -707,6 +868,7 @@ defineExpose({
   addTileLayer, removeTileLayer,
   addWMSTileLayer, setStyle, removeStyle, isSupportCanvas,
   addImageOverlay, updateImageOverlay,
+  addGeoJsonLayer, removeGeoJsonLayer, showGeoJsonLayer, hideGeoJsonLayer,
   setMapBearing, setMapTilt, getMapBearing, getMapTilt, setRotateEnabled, setTiltEnabled,
   addMarkerCluster, removeMarkerCluster, addHeatmap, removeHeatmap,
   isMapReady,
