@@ -15,10 +15,12 @@ import { MLNShape } from "MapLibre"
 import { NSPredicate, NSDictionary } from "Foundation"
 import { MLNCoordinateBoundsMake } from "MapLibre"
 import { CLLocationCoordinate2DMake, CLLocationManager, CLLocation } from "CoreLocation"
-import { UITapGestureRecognizer, UILongPressGestureRecognizer, UIColor, UIGraphicsImageRenderer, UIImagePNGRepresentation } from "UIKit"
+import { UITapGestureRecognizer, UILongPressGestureRecognizer, UIColor, UIGraphicsImageRenderer, UIImagePNGRepresentation, UIImage } from "UIKit"
 import { UIEdgeInsets } from "UIKit"
 import { NSURL, NSExpression, NSBundle, NSString } from "Foundation"
-import { TDMapOptions, MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MapClickCallback, MapReadyCallback, MapErrorCallback, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions } from '../interface.uts'
+// v1.9.0: 图片覆盖物（MLNImageSource + MLNRasterStyleLayer）
+import { MLNImageSource } from "MapLibre"
+import { TDMapOptions, MapClickDetail, MapBoundsDetail, MapErrorDetail, MapSizeDetail, MapViewportDetail, MapClickCallback, MapReadyCallback, MapErrorCallback, MarkerClickCallback, GeocodeCallback, SearchOptions, MapLongClickCallback, CameraChangeCallback, ClusterOptions, HeatmapItem, HeatmapOptions, TileLayerOptions, ImageOverlayOptions, ImageOverlayUpdateOptions, ImageOverlayClickCallback } from '../interface.uts'
 
 // ⚠️ 天地图 Key 类型说明（自新系统升级后严格区分，混用会导致瓦片不显示）:
 //   - "浏览器端" key：校验 Referer 头 + 域名白名单 → 原生 App 不发送浏览器 Referer → 403 被拒 → 灰白背景
@@ -45,10 +47,19 @@ let overlayMap = new Map<number, OverlayEntry>()
 
 type OverlayEntry = {
     id: number
-    type: string  // 'marker' | 'polygon' | 'polyline' | 'circle' | 'rectangle' | 'label'
-    nativeRef: any  // MLNPointAnnotation or { source: MLNShapeSource, layer: MLNStyleLayer }
+    type: string  // 'marker' | 'polygon' | 'polyline' | 'circle' | 'rectangle' | 'label' | 'image'
+    nativeRef: any  // MLNPointAnnotation or { source, layer }（形状与 image 均为 source+layer 包装）
     isVisible: boolean
 }
+
+// ── v1.9.0: 图片覆盖物状态 ──
+// removeOverlay/showOverlay/hideOverlay 的 else 分支（ref.layer / ref.source）对 {source, layer} 天然适用；
+// imageOverlayExt 额外持有 params 快照（update 合并/样式重建重放）与 uiImage（本机路径加载复用）
+type ImageOverlayExt = { source: any, layer: any, params: ImageOverlayOptions, uiImage: any | null }
+let imageOverlayExt = new Map<number, ImageOverlayExt>()
+// 平行数组存添加顺序（zIndex 定位/重建重放；iOS 无公开的 style 有序层列表，层序由自身插入逻辑维护）
+let imageOverlayIds: Array<number> = []
+let imageOverlayClickCallback: ImageOverlayClickCallback | null = null
 
 let markerClickCallback: MarkerClickCallback | null = null
 let mapLongClickCallback: MapLongClickCallback | null = null
@@ -267,6 +278,34 @@ export function initMap(
                     mapView.setCenterCoordinate(CLLocationCoordinate2DMake(cluster.coordinate.latitude, cluster.coordinate.longitude), zoom, true)
                     return  // 聚合点击消费事件，不触发 onClick
                 }
+            }
+        }
+        // v1.9.0: 图片覆盖物几何命中检测（不用 visibleFeatures——raster 图层无要素；
+        // 档位高者优先，同档后添加优先），命中即消费事件不触发 mapClick，与 Android/Web 三端同版算法
+        if (mapView != null && imageOverlayClickCallback != null && imageOverlayIds.length > 0) {
+            const imgPoint = gesture.locationInView(mapView)
+            const imgCoord = mapView.convertPoint(imgPoint, toCoordinateFromView: mapView)
+            let hitId = 0
+            let hitKey = -2000000
+            let hitIdx = -1
+            for (let i = 0; i < imageOverlayIds.length; i++) {
+                const oid = imageOverlayIds[i]
+                const entryImg = overlayMap.get(oid)
+                const extImg = imageOverlayExt.get(oid)
+                if (entryImg == null || extImg == null) continue
+                if (!entryImg.isVisible) continue
+                if (extImg.params.clickable == false) continue
+                if (!hitTestImageOverlay(imgCoord.latitude, imgCoord.longitude, extImg.params)) continue
+                const key = imageOverlayZKey(extImg.params.zIndex ?? null)
+                if (key > hitKey || (key == hitKey && i > hitIdx)) {
+                    hitId = oid
+                    hitKey = key
+                    hitIdx = i
+                }
+            }
+            if (hitId > 0) {
+                imageOverlayClickCallback({ id: hitId, lat: imgCoord.latitude, lng: imgCoord.longitude })
+                return  // 图片点击消费事件，不触发 mapClick
             }
         }
         if (mapView != null && onClickCallback != null) {
@@ -604,6 +643,22 @@ export function setMarkers(markers: Array<MapClickDetail>): Array<number> {
 export function clearOverlays(): void {
     clearMarkers()
     clearPolygons()
+    // v1.9.0: 清除图片覆盖物（style 层系，须逐个 removeLayer/removeSource；mapView 为空时仅清状态）
+    for (let i = 0; i < imageOverlayIds.length; i++) {
+        const oid = imageOverlayIds[i]
+        const extImgClear = imageOverlayExt.get(oid)
+        if (extImgClear != null && mapView?.style != null) {
+            try {
+                mapView.style?.removeLayer(extImgClear.layer)
+                mapView.style?.removeSource(extImgClear.source)
+            } catch (e: any) {
+                console.error("TDTMap: clearOverlays 图片层移除失败: " + (e.message ?? String(e)))
+            }
+        }
+        overlayMap.delete(oid)
+        imageOverlayExt.delete(oid)
+    }
+    imageOverlayIds = []
     if (mapView == null) {
         clearOverlayType('polyline')
         clearOverlayType('circle')
@@ -726,6 +781,10 @@ export function destroyMap(): void {
         clusterOptionsRef = null
         heatmapDataRef = null
         heatmapOptionsRef = null
+        // v1.9.0: 图片覆盖物状态
+        imageOverlayExt.clear()
+        imageOverlayIds = []
+        imageOverlayClickCallback = null
         if (delegate != null) {
             UTSiOS.destroyInstance(delegate)
         }
@@ -897,6 +956,9 @@ export function removeOverlay(id: number): void {
     const entry = overlayMap.get(id)
     if (entry == null || mapView == null) {
         overlayMap.delete(id)
+        // v1.9.0: 图片覆盖物状态同步清理（非图片 ID 时为无害 no-op）
+        imageOverlayExt.delete(id)
+        imageOverlayIds = imageOverlayIds.filter(x => x != id)
         return
     }
     const ref = entry.nativeRef
@@ -922,6 +984,9 @@ export function removeOverlay(id: number): void {
         }
     }
     overlayMap.delete(id)
+    // v1.9.0: 图片覆盖物状态同步清理（非图片 ID 时为无害 no-op）
+    imageOverlayExt.delete(id)
+    imageOverlayIds = imageOverlayIds.filter(x => x != id)
 }
 
 // context7 验证：iOS 形状通过 layer.isVisible 控制显隐，标注通过 addAnnotation/removeAnnotation 控制
@@ -937,6 +1002,9 @@ export function showOverlay(id: number): void {
         ref.layer.isVisible = true
     }
     entry.isVisible = true
+    // v1.9.0: 图片覆盖物可见性同步（重建重放读取 params.visible）
+    const extShow = imageOverlayExt.get(id)
+    if (extShow != null) extShow.params.visible = true
 }
 
 export function hideOverlay(id: number): void {
@@ -951,6 +1019,9 @@ export function hideOverlay(id: number): void {
         ref.layer.isVisible = false
     }
     entry.isVisible = false
+    // v1.9.0: 图片覆盖物可见性同步（重建重放读取 params.visible）
+    const extHide = imageOverlayExt.get(id)
+    if (extHide != null) extHide.params.visible = false
 }
 
 // ══════════════════════════════════════════════
@@ -1445,6 +1516,36 @@ function rebuildUserLayersAfterStyle(): void {
         heatmapOptionsRef = null
         addHeatmap(pts, opts)
     }
+    // v1.9.0: 图片覆盖物重放（uiImage 本地加载的复用持有；URL 的交给引擎重新下载；
+    // 重建 entry 由 attach 回填，隐藏过的以快照恢复）
+    if (imageOverlayIds.length > 0) {
+        const savedImgs: Array<any> = []
+        for (let i = 0; i < imageOverlayIds.length; i++) {
+            const oid = imageOverlayIds[i]
+            const ext = imageOverlayExt.get(oid)
+            const entry0 = overlayMap.get(oid)
+            if (ext != null) {
+                savedImgs.push({ id: oid, params: ext.params, visible: entry0 != null ? entry0.isVisible : true })
+            }
+        }
+        imageOverlayExt.clear()
+        imageOverlayIds = []
+        for (let i = 0; i < savedImgs.length; i++) {
+            const oid = savedImgs[i].id as number
+            overlayMap.set(oid, { id: oid, type: 'image', nativeRef: null, isVisible: true })
+            const okAttach = attachImageOverlayToStyle(oid, savedImgs[i].params as ImageOverlayOptions)
+            if (okAttach) {
+                const snapVisible = savedImgs[i].visible as boolean
+                const entry2 = overlayMap.get(oid)
+                if (!snapVisible && entry2 != null && entry2.nativeRef != null) {
+                    (entry2.nativeRef.layer as MLNRasterStyleLayer).isVisible = false
+                    entry2.isVisible = false
+                }
+            } else {
+                overlayMap.delete(oid)
+            }
+        }
+    }
 }
 
 // context7: MLNMapView.h 官方源码——styleJSON 属性"Setting this property results in an asynchronous
@@ -1686,4 +1787,294 @@ export function removeHeatmap(): void {
     }
     heatmapLayerRef = null
     heatmapSourceRef = null
+}
+
+// ════════════════════════════════════════════
+// v1.9.0 新增：图片覆盖物（ImageOverlay）
+// MLNImageSource+MLNRasterStyleLayer（style 层系）｜URL 引擎直载 / 本机路径 UIImage 同步读｜几何 hit-test 点击
+// ════════════════════════════════════════════
+
+// ── 图片覆盖物几何工具（Android/iOS/Web 三端同版纯函数，修改须三端同步；POC 浏览器实测验证） ──
+
+// zIndex 档位键：未定义=置顶组(1e6) / 正整数=按值排序 / 0 及以下=贴底组(-1)（对齐 TileLayerOptions 三档约定）
+function imageOverlayZKey(z: number | null): number {
+    if (z == null) return 1000000
+    if (z <= 0) return -1
+    return z
+}
+
+// Web Mercator 正投影：x=经度，y=墨卡托 Y（避免高纬度经纬直接旋转形变）
+function mercatorY(lat: number): number {
+    const rad = lat * Math.PI / 180.0
+    return Math.log(Math.tan(Math.PI / 4.0 + rad / 2.0))
+}
+function inverseMercatorY(y: number): number {
+    return (2.0 * Math.atan(Math.exp(y)) - Math.PI / 2.0) * 180.0 / Math.PI
+}
+
+// 计算图片四角坐标（官方顺序：左上/右上/右下/左下，[lng,lat] 对）；bearing≠0 时在 Mercator 平面绕中心顺时针旋转
+function computeImageQuad(sw: MapClickDetail, ne: MapClickDetail, bearing: number): Array<Array<number>> {
+    const corners: Array<Array<number>> = [
+        [sw.lng, ne.lat],
+        [ne.lng, ne.lat],
+        [ne.lng, sw.lat],
+        [sw.lng, sw.lat]
+    ]
+    if (bearing == 0) return corners
+    const rad = -bearing * Math.PI / 180.0
+    const cx = (sw.lng + ne.lng) / 2.0
+    const cyM = (mercatorY(sw.lat) + mercatorY(ne.lat)) / 2.0
+    const out: Array<Array<number>> = []
+    for (let i = 0; i < 4; i++) {
+        const x = corners[i][0] - cx
+        const y = mercatorY(corners[i][1]) - cyM
+        const rx = x * Math.cos(rad) - y * Math.sin(rad)
+        const ry = x * Math.sin(rad) + y * Math.cos(rad)
+        out.push([cx + rx, inverseMercatorY(cyM + ry)])
+    }
+    return out
+}
+
+// 点击命中检测：点击点正向旋转回未旋转 bounds 坐标系后与轴对齐半宽半高比较（与 computeImageQuad 互逆）
+function hitTestImageOverlay(lat: number, lng: number, params: ImageOverlayOptions): boolean {
+    const sw = params.southwest
+    const ne = params.northeast
+    const bearing = params.bearing ?? 0
+    if (bearing == 0) {
+        return lat >= sw.lat && lat <= ne.lat && lng >= sw.lng && lng <= ne.lng
+    }
+    const rad = bearing * Math.PI / 180.0
+    const cx = (sw.lng + ne.lng) / 2.0
+    const cyM = (mercatorY(sw.lat) + mercatorY(ne.lat)) / 2.0
+    const x = lng - cx
+    const y = mercatorY(lat) - cyM
+    const rx = x * Math.cos(rad) - y * Math.sin(rad)
+    const ry = x * Math.sin(rad) + y * Math.cos(rad)
+    const halfW = (ne.lng - sw.lng) / 2.0
+    const halfH = (mercatorY(ne.lat) - mercatorY(sw.lat)) / 2.0
+    return Math.abs(rx) <= halfW && Math.abs(ry) <= halfH
+}
+
+// 四角数组 → CLLocationCoordinate2D 数组（MLNImageSource coordinateQuad 参数，顺序同 GL JS image source）
+function buildCoordinateQuad(quad: Array<Array<number>>): Array<CLLocationCoordinate2D> {
+    const pts: Array<CLLocationCoordinate2D> = []
+    for (let i = 0; i < 4; i++) {
+        pts.push(CLLocationCoordinate2DMake(quad[i][1], quad[i][0]))
+    }
+    return pts
+}
+
+// 层序定位：iOS 无公开的 style 有序层列表，相对层序由自身插入逻辑维护（imageOverlayIds + 档位键）
+// 在现有图片层中找档位键更大的第一个层（below 语义）；null 表示追加置顶
+function imageOverlayBeforeLayerRef(newKey: number, excludeId: number): any | null {
+    const style = mapView?.style
+    if (style == null) return null
+    for (let i = 0; i < imageOverlayIds.length; i++) {
+        const oid = imageOverlayIds[i]
+        if (oid == excludeId) continue
+        const info = imageOverlayExt.get(oid)
+        if (info == null) continue
+        if (imageOverlayZKey(info.params.zIndex ?? null) > newKey) {
+            return style.layerWithIdentifier("img-overlay-layer-" + oid)
+        }
+    }
+    return null
+}
+
+// 档位键最小（渲染最下）的其他图片层；null 表示无（zIndex=0 无注记层时的降级锚点，与 Web/Android 一致）
+function lowestImageLayerRef(excludeId: number): any | null {
+    const style = mapView?.style
+    if (style == null) return null
+    let lowest: any | null = null
+    let lowestKey = 2147483647
+    let lowestIdx = 2147483647
+    for (let i = 0; i < imageOverlayIds.length; i++) {
+        const oid = imageOverlayIds[i]
+        if (oid == excludeId) continue
+        const info = imageOverlayExt.get(oid)
+        if (info == null) continue
+        const key = imageOverlayZKey(info.params.zIndex ?? null)
+        if (key < lowestKey || (key == lowestKey && i < lowestIdx)) {
+            lowestKey = key
+            lowestIdx = i
+            lowest = style.layerWithIdentifier("img-overlay-layer-" + oid)
+        }
+    }
+    return lowest
+}
+
+// zIndex 三档插入：0 及以下=注记层之下（缺失降级图片层最下）/ 未定义=置顶 / 正整数=按档位插入
+function placeImageLayerByZIndex(layer: MLNRasterStyleLayer, z: number | null, excludeId: number): void {
+    const style = mapView?.style
+    if (style == null) return
+    if (z != null && z <= 0) {
+        const labelLayer = style.layerWithIdentifier("tdt-label-" + currentMapType + "-layer")
+        if (labelLayer != null) {
+            style.insertLayer(layer, below: labelLayer)
+        } else {
+            const lowest = lowestImageLayerRef(excludeId)
+            if (lowest != null) {
+                style.insertLayer(layer, below: lowest)
+            } else {
+                style.addLayer(layer)
+            }
+            console.warn("TDTMap: 图片覆盖物 zIndex=0 但当前样式无注记层，已按图片层最下处理")
+        }
+        return
+    }
+    const before = imageOverlayBeforeLayerRef(imageOverlayZKey(z), excludeId)
+    if (before != null) {
+        style.insertLayer(layer, below: before)
+    } else {
+        style.addLayer(layer)
+    }
+}
+
+// 创建 source+layer 挂载到当前 style 并回填状态；返回 false 表示加载失败（本机路径不存在等）
+// ⚠️ 编译期验证项：MLNImageSource 初始化器 named 参数桥接（initWithIdentifier:coordinateQuad:url:/image:）；
+// 若桥接报错，改用先构造后赋值（source.URL = / setImage 类 setter），记录到 Task 验证项
+function attachImageOverlayToStyle(id: number, params: ImageOverlayOptions): boolean {
+    const style = mapView?.style
+    if (style == null) return false
+    const sourceId = "img-overlay-src-" + id
+    const layerId = "img-overlay-layer-" + id
+    const quad = buildCoordinateQuad(computeImageQuad(params.southwest, params.northeast, params.bearing ?? 0))
+    const isHttp = params.image.indexOf("http://") == 0 || params.image.indexOf("https://") == 0
+    let source: MLNImageSource
+    let uiImg: any | null = null
+    if (isHttp) {
+        // URL 直载：引擎内部异步下载（规避 UTS 无异步下载先例）
+        const nsurl = NSURL.URLWithString(params.image)
+        if (nsurl == null) {
+            if (onErrorCallback != null) {
+                onErrorCallback({ code: 4, message: "图片 URL 非法: " + params.image })
+            }
+            return false
+        }
+        source = new MLNImageSource(sourceId, coordinateQuad: quad, url: nsurl)
+    } else {
+        // 本机路径：外部维护的缓存通常为热数据，同步读盘可接受（ UIImage 引擎负责解码）
+        uiImg = UIImage(contentsOfFile: params.image)
+        if (uiImg == null) {
+            if (onErrorCallback != null) {
+                onErrorCallback({ code: 4, message: "图片加载失败（路径不存在或非图片）: " + params.image })
+            }
+            return false
+        }
+        source = new MLNImageSource(sourceId, coordinateQuad: quad, image: uiImg as UIImage)
+    }
+    style.addSource(source)
+    const layer = new MLNRasterStyleLayer(layerId, source)
+    layer.rasterOpacity = NSExpression(forConstantValue: 1.0 - (params.transparency ?? 0))
+    const visible = params.visible ?? true
+    layer.isVisible = visible
+    placeImageLayerByZIndex(layer, params.zIndex, id)
+    imageOverlayExt.set(id, { source: source, layer: layer, params: params, uiImage: uiImg })
+    const entry = overlayMap.get(id)
+    if (entry != null) {
+        entry.nativeRef = { source: source, layer: layer }
+        entry.isVisible = visible
+    }
+    if (imageOverlayIds.indexOf(id) < 0) {
+        imageOverlayIds.push(id)
+    }
+    return true
+}
+
+export function addImageOverlay(params: ImageOverlayOptions): number {
+    if (mapView == null || mapView.style == null) {
+        if (onErrorCallback != null) {
+            onErrorCallback({ code: 4, message: "样式未加载，无法添加图片覆盖物" })
+        }
+        return 0
+    }
+    const id = allocateOverlayId('image', null)
+    try {
+        if (!attachImageOverlayToStyle(id, params)) {
+            overlayMap.delete(id)
+            return 0
+        }
+    } catch (e: any) {
+        console.error("TDTMap: addImageOverlay 失败: " + (e.message ?? String(e)))
+        overlayMap.delete(id)
+        if (onErrorCallback != null) {
+            onErrorCallback({ code: 2, message: "添加图片覆盖物失败: " + (e.message ?? String(e)) })
+        }
+        return 0
+    }
+    return id
+}
+
+export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOptions): void {
+    const entry = overlayMap.get(id)
+    const ext = imageOverlayExt.get(id)
+    if (entry == null || ext == null || mapView == null) return
+    if (entry.nativeRef == null) {
+        console.warn("TDTMap: updateImageOverlay - 图片加载中，本次更新已忽略")
+        return
+    }
+    const p = ext.params
+    const oldZ = p.zIndex ?? null
+    // 合并变更（未传字段保持不变）
+    if (changes.southwest != null) p.southwest = changes.southwest
+    if (changes.northeast != null) p.northeast = changes.northeast
+    if (changes.image != null) p.image = changes.image
+    if (changes.transparency != null) p.transparency = changes.transparency
+    if (changes.zIndex != null) p.zIndex = changes.zIndex
+    if (changes.bearing != null) p.bearing = changes.bearing
+    if (changes.visible != null) p.visible = changes.visible
+    if (changes.clickable != null) p.clickable = changes.clickable
+    try {
+        // 范围/旋转/换图变化：MLNImageSource 坐标/URL setter 的 UTS 桥接未验证（编译期验证项），
+        // 采用确定性方案：remove+重挂载（同 ID，attach 重放全部合并参数含透明度/可见性）
+        if (changes.southwest != null || changes.northeast != null || changes.bearing != null || changes.image != null) {
+            const style = mapView?.style
+            if (style != null) {
+                const ref0 = entry.nativeRef
+                try {
+                    style.removeLayer(ref0.layer)
+                    style.removeSource(ref0.source)
+                } catch (e2: any) { /* 旧样式残留容忍 */ }
+                imageOverlayIds = imageOverlayIds.filter(x => x != id)
+                imageOverlayExt.delete(id)
+                if (!attachImageOverlayToStyle(id, p)) {
+                    overlayMap.delete(id)
+                } else {
+                    // 保持 entry.isVisible 与重建层一致
+                    const entry3 = overlayMap.get(id)
+                    if (entry3 != null) entry.isVisible = entry3.isVisible
+                }
+            }
+            return
+        }
+        const ref = entry.nativeRef
+        const layer = ref.layer as MLNRasterStyleLayer
+        if (changes.transparency != null) {
+            layer.rasterOpacity = NSExpression(forConstantValue: 1.0 - (p.transparency ?? 0))
+        }
+        if (changes.visible != null) {
+            const visible = p.visible != false
+            layer.isVisible = visible
+            entry.isVisible = visible
+        }
+        // zIndex 档位变化：iOS 无 moveLayer，removeLayer 后按新档位重插（同一 layer 对象可复用）
+        if (changes.zIndex != null && imageOverlayZKey(p.zIndex ?? null) != imageOverlayZKey(oldZ)) {
+            const style = mapView?.style
+            if (style != null) {
+                try { style.removeLayer(layer) } catch (e3: any) { /* 容忍 */ }
+                placeImageLayerByZIndex(layer, p.zIndex, id)
+            }
+        }
+    } catch (e: any) {
+        console.error("TDTMap: updateImageOverlay 失败: " + (e.message ?? String(e)))
+        if (onErrorCallback != null) {
+            onErrorCallback({ code: 4, message: "更新图片覆盖物失败: " + (e.message ?? String(e)) })
+        }
+    }
+}
+
+@UTSJS.keepAlive
+export function setImageOverlayClickCallback(callback: ImageOverlayClickCallback | null): void {
+    // 仅更新回调引用；命中检测在 initMap 注册的 tapGesture 闭包内执行（与 Android Priority 链同源）
+    imageOverlayClickCallback = callback
 }
