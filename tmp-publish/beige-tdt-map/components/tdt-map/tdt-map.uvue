@@ -16,7 +16,8 @@
     动画不推进同源——SDK 内 View 动态更新机制在 native-view 集成下失效），
     改用 uvue 层自定义气泡 + Web Mercator 数学换算，零原生依赖、热刷生效 -->
     <view v-if="bubbleVisible" class="tdt-marker-bubble" :style="{ left: bubbleX + 'px', top: bubbleY + 'px' }" @tap="hideBubble">
-      <text class="tdt-marker-bubble-text">{{ bubbleText }}</text>
+      <!-- 多行省略：lines CSS 属性已废弃，须用组件属性 max-lines（保留 text-overflow: ellipsis 配合） -->
+      <text class="tdt-marker-bubble-text" :max-lines="2">{{ bubbleText }}</text>
       <view class="tdt-marker-bubble-arrow" />
     </view>
 
@@ -1017,7 +1018,6 @@ defineExpose({
 .tdt-marker-bubble-text {
   font-size: 24rpx;
   color: #333333;
-  lines: 2;
   text-overflow: ellipsis;
   text-align: center;
 }
