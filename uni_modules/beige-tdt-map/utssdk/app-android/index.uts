@@ -1395,6 +1395,10 @@ export function removeOverlay(id: number): void {
 export function showOverlay(id: number): void {
     const entry = overlayMap.get(id)
     if (entry == null) return
+    // 意图先行（v1.9.3）：本机路径图片覆盖物 nativeRef 为异步回填，ref 尚空时也要
+    // 记录显示意图——attach 时按 entry.isVisible 初始化层可见性，避免「建层后立即
+    // show」被静默丢弃导致帧层永远 NONE（雨汛通色斑/回波图空白踩坑实录）
+    entry.isVisible = true
     try {
         const ref = entry.nativeRef
         if (ref != null) {
@@ -1444,6 +1448,8 @@ export function showOverlay(id: number): void {
 export function hideOverlay(id: number): void {
     const entry = overlayMap.get(id)
     if (entry == null) return
+    // 意图先行（v1.9.3，对称 showOverlay）：ref 尚空时记录隐藏意图，attach 时生效
+    entry.isVisible = false
     try {
         const ref = entry.nativeRef
         if (ref != null) {
@@ -2101,13 +2107,39 @@ function buildLatLngQuad(quad: Array<Array<number>>): LatLngQuad {
     )
 }
 
+// uni fs 协议路径 → 原生物理绝对路径：unifile://usr/<rest> → {filesDir}/<rest>。
+// v1.9.3 修复：业务层经 uni.getFileSystemManager().writeFile 写入 USER_DATA_PATH 后
+// resolve 的源路径为 unifile:// 协议形态，原生 BitmapFactory 不识别该协议，
+// addImageOverlay 解码必然 FileNotFoundException(ENOENT) → 帧层全部剔除、界面呈现
+// 加载失败（雨汛通 rainfall/radar 帧图踩坑实录）。归一化收敛在解码唯一入口，
+// addImageOverlay 全部调用方受益；USER_DATA_PATH 尾斜杠拼接产生的双斜杠由
+// 文件系统路径归一化吸收，无需额外处理。非 unifile 形态原样返回（http(s)/file:// 等）。
+function normalizeUniFilePath(rawPath: string): string {
+    const prefix = "unifile://usr"
+    if (rawPath.startsWith(prefix)) {
+        // 分步判空收窄（UTS 对 !. 链式收窄不稳定，compiler-known-issues error18）；
+        // getAppContext() 为官方 API（utsandroid.md），返回 Context | null
+        const ctx = UTSAndroid.getAppContext()
+        if (ctx == null) {
+            return rawPath
+        }
+        const filesDirFile = ctx.getFilesDir()
+        if (filesDirFile == null) {
+            return rawPath
+        }
+        return filesDirFile.getAbsolutePath() + rawPath.substring(prefix.length)
+    }
+    return rawPath
+}
+
 // 两段解码：先 inJustDecodeBounds 取尺寸，最长边超限时 inSampleSize 下采样（防大图 OOM；
 // 官方算法：https://developer.android.com/topic/performance/graphics/load-bitmap）
 function decodeSampledBitmapFromFile(path: string, maxDim: number): any | null {
+    const nativePath = normalizeUniFilePath(path)
     try {
         const bounds = new BitmapFactory.Options()
         bounds.inJustDecodeBounds = true
-        BitmapFactory.decodeFile(path, bounds)
+        BitmapFactory.decodeFile(nativePath, bounds)
         let sample = 1
         let w = bounds.outWidth * 1.0
         let h = bounds.outHeight * 1.0
@@ -2116,7 +2148,7 @@ function decodeSampledBitmapFromFile(path: string, maxDim: number): any | null {
         }
         const opts = new BitmapFactory.Options()
         opts.inSampleSize = sample.toInt()
-        return BitmapFactory.decodeFile(path, opts)
+        return BitmapFactory.decodeFile(nativePath, opts)
     } catch (e: any) {
         console.error("TDTMap: 图片解码失败: " + e.message)
         return null
@@ -2217,7 +2249,10 @@ function attachImageOverlayToStyle(id: number, params: ImageOverlayOptions, styl
     style.addSource(source)
     const layer = new RasterLayer(layerId, sourceId)
     layer.setProperties(PropertyFactory.rasterOpacity((1.0 - (params.transparency ?? 0)).toFloat()))
-    const visible = params.visible ?? true
+    // v1.9.3：初始可见性以 entry.isVisible 为准（意图记录位）——建层前 show/hide
+    // 已被记录（本机路径异步 attach 场景），params.visible 仅作为预分配初值
+    const entry0 = overlayMap.get(id)
+    const visible = entry0 != null ? entry0.isVisible : (params.visible ?? true)
     if (!visible) {
         layer.setProperties(PropertyFactory.visibility(Property.NONE))
     }
@@ -2318,6 +2353,12 @@ export function addImageOverlay(params: ImageOverlayOptions): number {
     }
     // 预分配 ID（本机路径场景 nativeRef 先置空，解码完成后回填——对齐鸿蒙 addMarker 先例）
     const id = allocateOverlayId('image', null)
+    // v1.9.3：预分配 isVisible 默认 true，须同步为 params.visible（attach 以 entry.isVisible
+    // 为初始可见性的唯一事实源，见 attachImageOverlayToStyle）
+    const preEntry = overlayMap.get(id)
+    if (preEntry != null) {
+        preEntry.isVisible = params.visible ?? true
+    }
     const isHttp = params.image.indexOf("http://") == 0 || params.image.indexOf("https://") == 0
     try {
         if (isHttp) {
