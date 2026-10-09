@@ -10,17 +10,20 @@ import { GeoJsonSource, GeoJsonOptions } from "org.maplibre.android.style.source
 import { CircleLayer, SymbolLayer, HeatmapLayer } from "org.maplibre.android.style.layers"
 // v1.9.0: E0.3a styled 折线（LineLayer + GeoJsonSource）
 import { LineLayer, Layer } from "org.maplibre.android.style.layers"
+// v1.10.0: annotations→style layers 迁移（多边形填充层）
+import { FillLayer } from "org.maplibre.android.style.layers"
 import { FeatureCollection, Feature, Point, LineString } from "org.maplibre.geojson"
 import { JsonObject } from "com.google.gson"
 import { CameraPosition, CameraUpdateFactory } from "org.maplibre.android.camera"
 import { LatLng } from "org.maplibre.android.geometry"
 import { LatLngBounds } from "org.maplibre.android.geometry"
-import { MarkerOptions, Marker } from "org.maplibre.android.annotations"
-import { PolygonOptions, Polygon } from "org.maplibre.android.annotations"
-import { PolylineOptions, Polyline } from "org.maplibre.android.annotations"
+// v1.10.0: annotations 包（Marker/Polygon/Polyline）已弃用，六类覆盖物全部迁移至
+// GeoJsonSource + Layer 层系（FillLayer/LineLayer/SymbolLayer），minSdk 21 不变
 import { Color, BitmapFactory, Bitmap } from "android.graphics"
 // v1.9.0: E0.3b styled 文本（Canvas 文字转位图）
 import { Paint, Canvas } from "android.graphics"
+// v1.10.0: 图钉 Path 绘制 + marker/label 点击命中矩形容差
+import { Path, RectF } from "android.graphics"
 // v1.9.0: 图片覆盖物（ImageSource+RasterLayer / 本机路径两段解码）
 import { ImageSource } from "org.maplibre.android.style.sources"
 import { LatLngQuad } from "org.maplibre.android.geometry"
@@ -61,12 +64,35 @@ let onErrorCallback: MapErrorCallback | null = null
 let currentApiKey: string = ''
 let currentMapType: string = 'vec'
 
-// 标记和面列表 — 使用平台原生类型
-let markerList: Array<Marker> = []
-let polygonList: Array<Polygon> = []
-let polylineList: Array<Polyline> = []
-let circleList: Array<Polygon> = []
-let rectangleList: Array<Polygon> = []
+// ══════════════════════════════════════════════
+// v1.10.0: 覆盖物 style 层系状态（annotations API 弃用迁移，minSdk 21 不变）
+// marker/label 共享 source+layer + 快照数组（唯一事实源，hidden 即显隐意图位）；
+// polygon/polyline/circle/rectangle 独立 source+layer（ShapeOverlayRef）+ 快照（重放用）
+// ══════════════════════════════════════════════
+type MarkerSnapshot = { oid: number, lat: number, lng: number, title: string, snippet: string, hidden: boolean }
+type LabelSnapshot = { oid: number, lat: number, lng: number, text: string, hidden: boolean }
+type ShapeOverlayRef = { source: GeoJsonSource, layers: Array<any> }  // polygon/circle/rectangle: [fill, line]; polyline: [line]
+type VectorSnapshot = {
+    oid: number, kind: string,             // 'polygon' | 'polyline' | 'circle' | 'rectangle'
+    points: Array<MapClickDetail>,         // circle 已展开为 36 点（circleToPolygonPoints）
+    color: string, fillColor: string, width: number, visible: boolean
+}
+let markerSnapshots: Array<MarkerSnapshot> = []
+let labelSnapshots: Array<LabelSnapshot> = []
+let vectorSnapshots: Array<VectorSnapshot> = []
+let markerSourceRef: GeoJsonSource | null = null
+let markerLayerRef: SymbolLayer | null = null
+let labelSourceRef: GeoJsonSource | null = null
+let labelLayerRef: SymbolLayer | null = null
+// 当前 style 生命周期内图钉位图是否已注册（setStyle 后位图表清空，重放路径置 false 重注册）
+let markerBitmapRegistered: boolean = false
+const MARKER_SOURCE_ID = "tdt-marker-source"
+const MARKER_LAYER_ID = "tdt-marker-layer"
+const LABEL_SOURCE_ID = "tdt-label-source"
+const LABEL_LAYER_ID = "tdt-label-layer"
+const MARKER_ICON_NAME = "tdt-marker-icon"
+// marker/label 点击命中屏幕像素容差（legacy 为 0.0001 度经纬欧氏距离 ≈ 11m）
+const TAP_TOLERANCE_PX = 20.0
 
 // ── 覆盖物 ID 追踪系统 ──
 // 为每个添加的覆盖物分配唯一 ID，支持 removeOverlay/showOverlay/hideOverlay 单个操作
@@ -313,21 +339,41 @@ export function initMap(
                     }
                 }
             }
-            // Priority 1: 检查标记点击（markerClickCallback）
+            // v1.10.0: Priority 1: marker/label 点击（queryRenderedFeatures 矩形容差命中，
+            // 替代 legacy markerList 经纬欧氏遍历；hidden 快照不在 source 数据中，天然不命中）
             const markerCb = markerClickCallback
             if (markerCb != null) {
-                for (let i = 0; i < markerList.length; i++) {
-                    const mk = markerList[i]
-                    if (mk != null && mk.getPosition() != null) {
-                        const mkPos = mk.getPosition()
-                        const dist = Math.sqrt(
-                            (point.latitude - mkPos.latitude) * (point.latitude - mkPos.latitude) +
-                            (point.longitude - mkPos.longitude) * (point.longitude - mkPos.longitude)
-                        )
-                        // 容忍约 0.0001 度（约 11 米）的点击误差
-                        if (dist < 0.0001) {
-                            markerCb({ lat: mkPos.latitude, lng: mkPos.longitude })
-                            return true  // 事件由标记点击消费，不再触发 mapClick
+                const hitPt = map.getProjection().toScreenLocation(point)
+                const tol = TAP_TOLERANCE_PX.toFloat()
+                const hitRect = new RectF(hitPt.x - tol, hitPt.y - tol, hitPt.x + tol, hitPt.y + tol)
+                // 两次单层查询按 label > marker 合并（vararg 多参为编译验证项，单参先例 L301 稳妥）
+                let hitFeature: Feature | null = null
+                if (labelLayerRef != null) {
+                    const hitLabelRaw = map.queryRenderedFeatures(hitRect, LABEL_LAYER_ID)
+                    if (hitLabelRaw != null) {
+                        const hitLabelArr = Array.fromNative(hitLabelRaw)
+                        if (hitLabelArr.length > 0) { hitFeature = hitLabelArr[0] as Feature }
+                    }
+                }
+                if (hitFeature == null && markerLayerRef != null) {
+                    const hitMarkerRaw = map.queryRenderedFeatures(hitRect, MARKER_LAYER_ID)
+                    if (hitMarkerRaw != null) {
+                        const hitMarkerArr = Array.fromNative(hitMarkerRaw)
+                        if (hitMarkerArr.length > 0) { hitFeature = hitMarkerArr[0] as Feature }
+                    }
+                }
+                if (hitFeature != null) {
+                    // 契约不变：{lat,lng} = marker/label 坐标（properties 直存双精度，零精度损失）
+                    try {
+                        markerCb({ lat: hitFeature!.getNumberProperty("lat").toDouble(), lng: hitFeature!.getNumberProperty("lng").toDouble() })
+                        return true  // 事件由标记点击消费，不再触发 mapClick
+                    } catch (e: any) {
+                        // properties 缺失防御：回退 geometry 反解
+                        const geom = hitFeature!.geometry()
+                        if (geom != null) {
+                            const ptGeom = geom as Point
+                            markerCb({ lat: ptGeom.latitude(), lng: ptGeom.longitude() })
+                            return true
                         }
                     }
                 }
@@ -549,110 +595,430 @@ export function fitBounds(minLat: number, minLng: number, maxLat: number, maxLng
     }
 }
 
+// ══════════════════════════════════════════════
+// v1.10.0: style 层系 helper（annotations → GeoJsonSource+Layer 迁移）
+// ══════════════════════════════════════════════
+
+// JSON 字符串直构转义（title/snippet 等含引号/换行时保护 FeatureCollection 拼接）
+function escapeJson(s: string): string {
+    let out = ''
+    for (let i = 0; i < s.length; i++) {
+        const ch = s.charAt(i)
+        if (ch == '"') { out += '\\"' }
+        else if (ch == '\\') { out += '\\\\' }
+        else if (ch == '\n') { out += '\\n' }
+        else if (ch == '\r') { out += '\\r' }
+        else if (ch == '\t') { out += '\\t' }
+        else { out += ch }
+    }
+    return out
+}
+
+// 锚点层探测：返回 anchorIds 中第一个已存在的层 id（空串 = append 置顶）。
+// 覆盖物固定层序（自底向上）：shape(fill→line) < marker < label < 运行期 append 层
+function overlayAnchorLayerId(style: Style, anchorIds: Array<string>): string {
+    for (let i = 0; i < anchorIds.length; i++) {
+        const lyr = style.getLayer(anchorIds[i])
+        if (lyr != null) { return anchorIds[i] }
+    }
+    return ''
+}
+
+// 默认图钉位图（36dp 盒子：红色水滴头 + 三角尾 + 白色内圆；物理像素 = dp × density，对齐 addStyledText 先例）
+// 注意：number 域运算后显式 toFloat()（Float×Double 字面量会推导 Double，error17 已知问题）
+function buildDefaultPinBitmap(density: number): Bitmap {
+    const size = (36.0 * density).toInt()
+    const bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    const canvas = new Canvas(bmp)
+    const paint = new Paint(Paint.ANTI_ALIAS_FLAG)
+    paint.setColor(Color.parseColor("#E53935"))
+    canvas.drawCircle((18.0 * density).toFloat(), (13.0 * density).toFloat(), (10.0 * density).toFloat(), paint)
+    const tail = new Path()
+    tail.moveTo((8.0 * density).toFloat(), (13.0 * density).toFloat())
+    tail.lineTo((18.0 * density).toFloat(), (34.0 * density).toFloat())
+    tail.lineTo((28.0 * density).toFloat(), (13.0 * density).toFloat())
+    tail.close()
+    canvas.drawPath(tail, paint)
+    paint.setColor(Color.parseColor("#FFFFFF"))
+    canvas.drawCircle((18.0 * density).toFloat(), (13.0 * density).toFloat(), (5.0 * density).toFloat(), paint)
+    return bmp
+}
+
+// label 文字位图（14sp 深灰字 + 2dp 白 halo；绘制内核对齐 addStyledText Paint/Canvas 先例）
+// v1.10.0 行为修正说明：legacy 走 MarkerOptions.title——11.x native-view 下 InfoWindow 不显示，
+// 文字实际不可见；迁移后常显位图是"文字标注"语义唯一成立路径（三端差异见函数注释）
+function buildLabelBitmap(text: string, density: number): Bitmap {
+    const fontSizePx = 14.0 * density
+    const haloWidthPx = 2.0 * density
+    const pad = haloWidthPx + density
+    const paint = new Paint(Paint.ANTI_ALIAS_FLAG)
+    paint.setTextSize(fontSizePx.toFloat())
+    const textWidth = paint.measureText(text)
+    const fm = paint.getFontMetrics()
+    const textHeight = fm.descent.toDouble() - fm.ascent.toDouble()
+    const bmpW = Math.ceil(textWidth.toDouble() + pad * 2).toInt()
+    const bmpH = Math.ceil(textHeight + pad * 2).toInt()
+    const bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
+    const canvas = new Canvas(bmp)
+    // 文字基线：ascent 为负值，baselineY = pad - ascent 使文本顶部落在 pad
+    const baselineY = pad - fm.ascent.toDouble()
+    paint.setStyle(Paint.Style.STROKE)
+    paint.setStrokeWidth((haloWidthPx * 2).toFloat())
+    paint.setColor(Color.parseColor("#FFFFFF"))
+    canvas.drawText(text, pad.toFloat(), baselineY.toFloat(), paint)
+    paint.setStyle(Paint.Style.FILL)
+    paint.setColor(Color.parseColor("#333333"))
+    canvas.drawText(text, pad.toFloat(), baselineY.toFloat(), paint)
+    return bmp
+}
+
+function labelIconName(oid: number): string {
+    return "tdt-label-icon-" + oid.toString()
+}
+
+// label 位图注册（每 label 一张；重放时逐 snapshot 重画——位图不缓存持有，内存友好）
+function registerLabelBitmap(style: Style, oid: number, text: string): void {
+    const ctx = mapView?.getContext()
+    let density = 1.0
+    if (ctx != null) {
+        density = ctx.getResources().getDisplayMetrics().density.toDouble()
+    }
+    style.addImage(labelIconName(oid), buildLabelBitmap(text, density))
+}
+
+// marker 共享层幂等三合一：位图注册 + source/layer 建层 + z-order 锚定（marker 层在 label 层之下）
+function ensureMarkerStyle(style: Style): boolean {
+    try {
+        if (!markerBitmapRegistered) {
+            const ctx = mapView?.getContext()
+            let density = 1.0
+            if (ctx != null) {
+                density = ctx.getResources().getDisplayMetrics().density.toDouble()
+            }
+            style.addImage(MARKER_ICON_NAME, buildDefaultPinBitmap(density))
+            markerBitmapRegistered = true
+        }
+        if (markerLayerRef == null) {
+            const source = new GeoJsonSource(MARKER_SOURCE_ID, '{"type":"FeatureCollection","features":[]}')
+            style.addSource(source)
+            markerSourceRef = source
+            const layer = new SymbolLayer(MARKER_LAYER_ID, MARKER_SOURCE_ID)
+            layer.setProperties(
+                PropertyFactory.iconImage(MARKER_ICON_NAME),
+                PropertyFactory.iconSize(1.0.toFloat()),
+                PropertyFactory.iconAllowOverlap(true),
+                PropertyFactory.iconAnchor("bottom")
+            )
+            const anchor = overlayAnchorLayerId(style, [LABEL_LAYER_ID])
+            if (anchor.length > 0) {
+                style.addLayerBelow(layer, anchor)
+            } else {
+                style.addLayer(layer)
+            }
+            markerLayerRef = layer
+        }
+        return true
+    } catch (e: any) {
+        console.error("TDTMap: ensureMarkerStyle 失败: " + e.message)
+        return false
+    }
+}
+
+// label 共享层幂等建层（icon-image 取 feature properties 的 img 名，逐要素换图；恒 append 置顶）
+function ensureLabelStyle(style: Style): boolean {
+    try {
+        if (labelLayerRef == null) {
+            const source = new GeoJsonSource(LABEL_SOURCE_ID, '{"type":"FeatureCollection","features":[]}')
+            style.addSource(source)
+            labelSourceRef = source
+            const layer = new SymbolLayer(LABEL_LAYER_ID, LABEL_SOURCE_ID)
+            layer.setProperties(
+                PropertyFactory.iconImage(Expression.get("img")),
+                PropertyFactory.iconAllowOverlap(true),
+                PropertyFactory.iconAnchor("center")
+            )
+            style.addLayer(layer)
+            labelLayerRef = layer
+        }
+        return true
+    } catch (e: any) {
+        console.error("TDTMap: ensureLabelStyle 失败: " + e.message)
+        return false
+    }
+}
+
+// marker 快照 → FeatureCollection 全量重放（hidden 剔除；增删改单点 = 改数组 + 一次重放）
+function rebuildMarkerSource(): void {
+    const src = markerSourceRef
+    if (src == null) { return }
+    let json = '{"type":"FeatureCollection","features":['
+    let appended = 0
+    for (let i = 0; i < markerSnapshots.length; i++) {
+        const s = markerSnapshots[i]
+        if (s.hidden) { continue }
+        if (appended > 0) { json += ',' }
+        json += '{"type":"Feature","geometry":{"type":"Point","coordinates":['
+            + s.lng.toDouble().toString() + ',' + s.lat.toDouble().toString()
+            + ']},"properties":{"oid":' + s.oid.toString()
+            + ',"lat":' + s.lat.toDouble().toString()
+            + ',"lng":' + s.lng.toDouble().toString()
+            + ',"title":"' + escapeJson(s.title)
+            + '","snippet":"' + escapeJson(s.snippet) + '"}}'
+        appended++
+    }
+    json += ']}'
+    try {
+        src.setGeoJson(json)
+    } catch (e: any) {
+        console.error("TDTMap: rebuildMarkerSource 失败: " + e.message)
+    }
+}
+
+// label 快照 → FeatureCollection 全量重放（properties.img 指向逐要素注册的位图名）
+function rebuildLabelSource(): void {
+    const src = labelSourceRef
+    if (src == null) { return }
+    let json = '{"type":"FeatureCollection","features":['
+    let appended = 0
+    for (let i = 0; i < labelSnapshots.length; i++) {
+        const s = labelSnapshots[i]
+        if (s.hidden) { continue }
+        if (appended > 0) { json += ',' }
+        json += '{"type":"Feature","geometry":{"type":"Point","coordinates":['
+            + s.lng.toDouble().toString() + ',' + s.lat.toDouble().toString()
+            + ']},"properties":{"oid":' + s.oid.toString()
+            + ',"lat":' + s.lat.toDouble().toString()
+            + ',"lng":' + s.lng.toDouble().toString()
+            + ',"img":"' + labelIconName(s.oid) + '"}}'
+        appended++
+    }
+    json += ']}'
+    try {
+        src.setGeoJson(json)
+    } catch (e: any) {
+        console.error("TDTMap: rebuildLabelSource 失败: " + e.message)
+    }
+}
+
+// marker 快照 hidden 翻转 + 重放（show/hide 共用；未命中 oid 为无害 no-op）
+function setMarkerSnapshotHidden(oid: number, hidden: boolean): void {
+    for (let i = 0; i < markerSnapshots.length; i++) {
+        if (markerSnapshots[i].oid == oid) {
+            markerSnapshots[i].hidden = hidden
+        }
+    }
+    rebuildMarkerSource()
+}
+
+function setLabelSnapshotHidden(oid: number, hidden: boolean): void {
+    for (let i = 0; i < labelSnapshots.length; i++) {
+        if (labelSnapshots[i].oid == oid) {
+            labelSnapshots[i].hidden = hidden
+        }
+    }
+    rebuildLabelSource()
+}
+
+function setVectorSnapshotVisible(oid: number, visible: boolean): void {
+    for (let i = 0; i < vectorSnapshots.length; i++) {
+        if (vectorSnapshots[i].oid == oid) {
+            vectorSnapshots[i].visible = visible
+        }
+    }
+}
+
+// 环坐标 JSON（[[lng,lat],...]；toDouble().toString() 拼接对齐批量折线先例）
+function buildRingJson(points: Array<MapClickDetail>): string {
+    let ring = '['
+    for (let i = 0; i < points.length; i++) {
+        if (i > 0) { ring += ',' }
+        ring += '[' + points[i].lng.toDouble().toString() + ',' + points[i].lat.toDouble().toString() + ']'
+    }
+    ring += ']'
+    return ring
+}
+
+function shapeKindName(kind: string): string {
+    if (kind == 'polygon') { return '多边形' }
+    if (kind == 'polyline') { return '折线' }
+    if (kind == 'circle') { return '圆' }
+    if (kind == 'rectangle') { return '矩形' }
+    return '覆盖物'
+}
+
+// shape 重建内核：建 source+layer(s) + 回填 overlayMap/快照（oid 由调用方给定，重放保持原 ID）。
+// polygon/circle/rectangle = fill+line 双层（fill 先插保证 line 盖 fill）；
+// fill-color/line-color 直传含 alpha 的 Int（PropertyFactory 原生展开 rgba，语义对齐 legacy）
+function attachShapeOverlayToStyle(oid: number, kind: string, points: Array<MapClickDetail>, color: string, fillColor: string, width: number): boolean {
+    const style = mapLibreMap?.getStyle()
+    if (style == null) { return false }
+    const sourceId = "tdt-shape-src-" + oid.toString()
+    try {
+        const anchor = overlayAnchorLayerId(style, [MARKER_LAYER_ID, LABEL_LAYER_ID])
+        if (kind == 'polyline') {
+            const lineId = "tdt-shape-line-" + oid.toString()
+            const source = new GeoJsonSource(sourceId, '{"type":"LineString","coordinates":' + buildRingJson(points) + '}')
+            style.addSource(source)
+            const layer = new LineLayer(lineId, sourceId)
+            layer.setProperties(
+                PropertyFactory.lineColor(Color.parseColor(color)),
+                PropertyFactory.lineWidth(width.toFloat())
+            )
+            if (anchor.length > 0) {
+                style.addLayerBelow(layer, anchor)
+            } else {
+                style.addLayer(layer)
+            }
+            const layersArr: Array<any> = []
+            layersArr.push(layer)
+            const ref: ShapeOverlayRef = { source: source, layers: layersArr }
+            overlayMap.set(oid, { id: oid, type: kind, nativeRef: ref, isVisible: true })
+        } else {
+            const fillId = "tdt-shape-fill-" + oid.toString()
+            const lineId = "tdt-shape-line-" + oid.toString()
+            const source = new GeoJsonSource(sourceId, '{"type":"Polygon","coordinates":[' + buildRingJson(points) + ']}')
+            style.addSource(source)
+            const fill = new FillLayer(fillId, sourceId)
+            fill.setProperties(PropertyFactory.fillColor(Color.parseColor(fillColor)))
+            const line = new LineLayer(lineId, sourceId)
+            line.setProperties(
+                PropertyFactory.lineColor(Color.parseColor(color)),
+                // 对齐 legacy PolygonOptions 默认描边宽度 5px
+                PropertyFactory.lineWidth(5.0.toFloat())
+            )
+            if (anchor.length > 0) {
+                style.addLayerBelow(fill, anchor)
+                style.addLayerBelow(line, anchor)
+            } else {
+                style.addLayer(fill)
+                style.addLayer(line)
+            }
+            const layersArr: Array<any> = []
+            layersArr.push(fill)
+            layersArr.push(line)
+            const ref: ShapeOverlayRef = { source: source, layers: layersArr }
+            overlayMap.set(oid, { id: oid, type: kind, nativeRef: ref, isVisible: true })
+        }
+        const snap: VectorSnapshot = { oid: oid, kind: kind, points: points, color: color, fillColor: fillColor, width: width, visible: true }
+        vectorSnapshots.push(snap)
+        return true
+    } catch (e: any) {
+        console.error("TDTMap: 添加" + shapeKindName(kind) + "失败: " + e.message)
+        overlayMap.delete(oid)
+        return false
+    }
+}
+
+// shape 四类统一对外入口（分配 overlayId 后走 attach 内核）
+function addShapeOverlay(kind: string, points: Array<MapClickDetail>, color: string, fillColor: string, width: number): number {
+    const m = mapLibreMap
+    if (m == null) { return 0 }
+    if (kind == 'polyline') {
+        if (points.length < 2) { return 0 }
+    } else {
+        if (points.length < 3) { return 0 }
+    }
+    overlayIdCounter++
+    const id = overlayIdCounter
+    if (!attachShapeOverlayToStyle(id, kind, points, color, fillColor, width)) {
+        const errorCb = onErrorCallback
+        if (errorCb != null) {
+            errorCb({ code: 4, message: "添加" + shapeKindName(kind) + "失败" })
+        }
+        return 0
+    }
+    return id
+}
+
+// 按 kind 清除 shape 覆盖物（摘层摘 source + 快照/entry 清理；style 为空时仅清状态）
+function removeVectorOverlaysByKind(kind: string): void {
+    const style = mapLibreMap?.getStyle()
+    const keep: Array<VectorSnapshot> = []
+    for (let i = 0; i < vectorSnapshots.length; i++) {
+        const s = vectorSnapshots[i]
+        if (s.kind != kind) { keep.push(s); continue }
+        if (style != null) {
+            try {
+                const entry = overlayMap.get(s.oid)
+                const refAny = entry != null ? entry.nativeRef : null
+                if (refAny != null) {
+                    const ref = refAny as ShapeOverlayRef
+                    for (let j = 0; j < ref.layers.length; j++) {
+                        style.removeLayer(ref.layers[j] as Layer)
+                    }
+                    style.removeSource("tdt-shape-src-" + s.oid.toString())
+                }
+            } catch (e: any) {
+                console.error("TDTMap: 清除" + shapeKindName(kind) + "失败 id=" + s.oid.toString() + ": " + e.message)
+            }
+        }
+        overlayMap.delete(s.oid)
+    }
+    vectorSnapshots = keep
+    // clearOverlayType(kind) 兜底不在此调（定义位置在后，UTS 先声明后使用）；
+    // vectorSnapshots 与 overlayMap 的 shape 条目由 attach 内核一一回填，无孤儿
+}
+
 export function addMarker(lat: number, lng: number, title: string, snippet?: string): number {
     const m = mapLibreMap
+    const style = m?.getStyle()
     console.log("TDTMap: [DIAG] addMarker 调用 lat=" + lat + " lng=" + lng + " title=" + title + " map非空=" + (m != null))
-    if (m == null) return 0
-    let opts = new MarkerOptions()
-        .position(new LatLng(lat.toDouble(), lng.toDouble()))
-        .title(title)
-    // v1.3.0: 设置 snippet 以支持信息窗口
-    if (snippet != null && snippet.length > 0) {
-        opts.snippet(snippet)
-    }
-    let mk = m.addMarker(opts)
-    markerList.push(mk)
-    const id = allocateOverlayId('marker', mk)
+    if (m == null || style == null) return 0
+    // v1.10.0: 共享 SymbolLayer（图钉位图 + 快照数组，title/snippet 存 feature properties）
+    if (!ensureMarkerStyle(style)) return 0
+    const id = allocateOverlayId('marker', null)
+    const snap: MarkerSnapshot = { oid: id, lat: lat, lng: lng, title: title, snippet: snippet ?? '', hidden: false }
+    markerSnapshots.push(snap)
+    rebuildMarkerSource()
     console.log("TDTMap: [DIAG] addMarker 成功 id=" + id)
     return id
 }
 
 export function clearMarkers(): void {
-    const m = mapLibreMap
-    if (m != null) {
-        for (let i = 0; i < markerList.length; i++) {
-            m.removeMarker(markerList[i])
-        }
+    const style = mapLibreMap?.getStyle()
+    if (style != null) {
+        // 共享层整体摘除（marker+label 同层族，与 legacy 连带清 label 语义一致）
+        const ml = markerLayerRef
+        if (ml != null) { try { style.removeLayer(ml) } catch (e: any) { } }
+        try { style.removeSource(MARKER_SOURCE_ID) } catch (e: any) { }
+        const ll = labelLayerRef
+        if (ll != null) { try { style.removeLayer(ll) } catch (e: any) { } }
+        try { style.removeSource(LABEL_SOURCE_ID) } catch (e: any) { }
     }
+    markerSourceRef = null
+    markerLayerRef = null
+    labelSourceRef = null
+    labelLayerRef = null
+    markerSnapshots = []
+    labelSnapshots = []
     // 清理 overlayMap 中所有 marker/label 条目
     clearOverlayType('marker')
     clearOverlayType('label')
-    markerList = []
 }
 
 export function addPolygon(points: Array<MapClickDetail>, color: string, fillColor: string): number {
-    const m = mapLibreMap
-    if (m == null) return 0
-    const errorCb = onErrorCallback
-    try {
-        let opts = new PolygonOptions()
-        for (let i = 0; i < points.length; i++) {
-            let pt = points[i]
-            opts.add(new LatLng(pt.lat.toDouble(), pt.lng.toDouble()))
-        }
-        let strokeColorInt = Color.parseColor(color)
-        let fillColorInt = Color.parseColor(fillColor)
-        opts.strokeColor(strokeColorInt)
-        opts.fillColor(fillColorInt)
-        let polygon = m.addPolygon(opts)
-        polygonList.push(polygon)
-        return allocateOverlayId('polygon', polygon)
-    } catch (e: any) {
-        console.error("TDTMap: 添加多边形失败: " + e.message)
-        if (errorCb != null) {
-            const errDetail: MapErrorDetail = { code: 4, message: "添加多边形失败: " + e.message }
-            errorCb(errDetail)
-        }
-        return 0
-    }
+    // v1.10.0: FillLayer+LineLayer 双层（fill-color/line-color 含 alpha 原生展开）
+    return addShapeOverlay('polygon', points, color, fillColor, 0)
 }
 
 export function clearPolygons(): void {
-    const m = mapLibreMap
-    if (m == null) {
-        clearOverlayType('polygon')
-        polygonList = []
-        return
-    }
-    for (let i = 0; i < polygonList.length; i++) {
-        m.removePolygon(polygonList[i])
-    }
-    clearOverlayType('polygon')
-    polygonList = []
+    // v1.10.0: shape 层系按 kind 清除（摘层摘 source + 快照清理）
+    removeVectorOverlaysByKind('polygon')
 }
 
 // ==================== 覆盖物：折线 ====================
 
 export function addPolyline(points: Array<MapClickDetail>, color: string, width: number): number {
-    const m = mapLibreMap
-    if (m == null || points.length < 2) return 0
-    const errorCb = onErrorCallback
-    try {
-        let opts = new PolylineOptions()
-        for (let i = 0; i < points.length; i++) {
-            let pt = points[i]
-            opts.add(new LatLng(pt.lat.toDouble(), pt.lng.toDouble()))
-        }
-        opts.color(Color.parseColor(color))
-        opts.width(width.toFloat())
-        let polyline = m.addPolyline(opts)
-        polylineList.push(polyline)
-        return allocateOverlayId('polyline', polyline)
-    } catch (e: any) {
-        console.error("TDTMap: 添加折线失败: " + e.message)
-        if (errorCb != null) {
-            const err: MapErrorDetail = { code: 4, message: "添加折线失败: " + e.message }
-            errorCb(err)
-        }
-        return 0
-    }
+    // v1.10.0: LineLayer 单层（样式语义 = addStyledPolyline 的 dash=null/opacity=1.0 档，
+    // 管理面走 vectorSnapshots 纳入重放；styled 变体保持独立通路不动——现网关键路径零改动）
+    return addShapeOverlay('polyline', points, color, '', width)
 }
 
 // ══════════════════════════════════════════════
 // v1.9.0 新增：E0.3a styled 折线（LineLayer+GeoJsonSource，虚线/透明度）
 // ══════════════════════════════════════════════
-// legacy addPolyline 走 PolylineOptions 注记路径（无 dash 能力，保持不动）；
-// styled 变体走 style 层系（source+layer），与 image 覆盖物同款 {source, layer} 包装与命名惯例
+// v1.10.0 起 legacy addPolyline 亦走 LineLayer 层系（addShapeOverlay('polyline')）；
+// styled 变体保持独立通路（styledPolylines 数组 + 'styledPolyline' 类型，不参与重放，现状保持）
 type StyledPolylineEntry = { source: GeoJsonSource, layer: LineLayer }
 let styledPolylines: Array<StyledPolylineEntry> = []
 
@@ -904,67 +1270,44 @@ function circleToPolygonPoints(lat: number, lng: number, radius: number, segment
 export function addCircle(lat: number, lng: number, radius: number, color: string, fillColor: string): number {
     const m = mapLibreMap
     if (m == null) return 0
-    const errorCb = onErrorCallback
-    try {
-        const circlePoints = circleToPolygonPoints(lat, lng, radius, 36)
-        let opts = new PolygonOptions()
-        for (let i = 0; i < circlePoints.length; i++) {
-            let pt = circlePoints[i]
-            opts.add(new LatLng(pt.lat.toDouble(), pt.lng.toDouble()))
-        }
-        opts.strokeColor(Color.parseColor(color))
-        opts.fillColor(Color.parseColor(fillColor))
-        let polygon = m.addPolygon(opts)
-        circleList.push(polygon)
-        return allocateOverlayId('circle', polygon)
-    } catch (e: any) {
-        console.error("TDTMap: 添加圆失败: " + e.message)
-        if (errorCb != null) {
-            const err: MapErrorDetail = { code: 4, message: "添加圆失败: " + e.message }
-            errorCb(err)
-        }
-        return 0
-    }
+    // v1.10.0: 保持 36 边 Polygon 近似（CircleLayer 半径为像素单位，语义不同不采用）
+    const circlePoints = circleToPolygonPoints(lat, lng, radius, 36)
+    return addShapeOverlay('circle', circlePoints, color, fillColor, 0)
 }
 
 // ==================== 覆盖物：矩形 ====================
 
 export function addRectangle(minLat: number, minLng: number, maxLat: number, maxLng: number, color: string, fillColor: string): number {
-    const m = mapLibreMap
-    if (m == null) return 0
-    const errorCb = onErrorCallback
-    try {
-        let opts = new PolygonOptions()
-        opts.add(new LatLng(minLat.toDouble(), minLng.toDouble()))
-        opts.add(new LatLng(maxLat.toDouble(), minLng.toDouble()))
-        opts.add(new LatLng(maxLat.toDouble(), maxLng.toDouble()))
-        opts.add(new LatLng(minLat.toDouble(), maxLng.toDouble()))
-        opts.strokeColor(Color.parseColor(color))
-        opts.fillColor(Color.parseColor(fillColor))
-        let polygon = m.addPolygon(opts)
-        rectangleList.push(polygon)
-        return allocateOverlayId('rectangle', polygon)
-    } catch (e: any) {
-        console.error("TDTMap: 添加矩形失败: " + e.message)
-        if (errorCb != null) {
-            const err: MapErrorDetail = { code: 4, message: "添加矩形失败: " + e.message }
-            errorCb(err)
-        }
-        return 0
-    }
+    // v1.10.0: 四点矩形走 shape 统一入口
+    const pts: Array<MapClickDetail> = []
+    pts.push({ lat: minLat, lng: minLng })
+    pts.push({ lat: maxLat, lng: minLng })
+    pts.push({ lat: maxLat, lng: maxLng })
+    pts.push({ lat: minLat, lng: maxLng })
+    return addShapeOverlay('rectangle', pts, color, fillColor, 0)
 }
 
 // ==================== 覆盖物：文字标注 ====================
 
 export function addLabel(lat: number, lng: number, text: string): number {
     const m = mapLibreMap
-    if (m == null) return 0
-    let opts = new MarkerOptions()
-        .position(new LatLng(lat.toDouble(), lng.toDouble()))
-        .title(text)
-    let mk = m.addMarker(opts)
-    markerList.push(mk)
-    return allocateOverlayId('label', mk)
+    const style = m?.getStyle()
+    if (m == null || style == null) return 0
+    // v1.10.0: 文字位图 + SymbolLayer icon-image（屏幕像素语义；glyphs 供应链不可达，
+    // text-field 大概率静默失败——legacy 11.x 下 title 随 InfoWindow 缺陷实际不可见，常显位图属缺陷修正）
+    if (!ensureLabelStyle(style)) return 0
+    const id = allocateOverlayId('label', null)
+    try {
+        registerLabelBitmap(style, id, text)
+    } catch (e: any) {
+        console.error("TDTMap: 添加文字标注失败: " + e.message)
+        overlayMap.delete(id)
+        return 0
+    }
+    const snap: LabelSnapshot = { oid: id, lat: lat, lng: lng, text: text, hidden: false }
+    labelSnapshots.push(snap)
+    rebuildLabelSource()
+    return id
 }
 
 // ==================== 覆盖物：批量标记 ====================
@@ -972,16 +1315,19 @@ export function addLabel(lat: number, lng: number, text: string): number {
 export function setMarkers(markers: Array<MapClickDetail>): Array<number> {
     clearMarkers()
     const m = mapLibreMap
+    const style = m?.getStyle()
     const ids: Array<number> = []
-    if (m == null || markers.length == 0) return ids
+    if (m == null || style == null || markers.length == 0) return ids
+    // v1.10.0: 共享层只建一次，快照批量入列后单次重放（性能优于 legacy 逐个 addMarker）
+    if (!ensureMarkerStyle(style)) return ids
     for (let i = 0; i < markers.length; i++) {
-        let pt = markers[i]
-        let opts = new MarkerOptions()
-            .position(new LatLng(pt.lat.toDouble(), pt.lng.toDouble()))
-        let mk = m.addMarker(opts)
-        markerList.push(mk)
-        ids.push(allocateOverlayId('marker', mk))
+        const pt = markers[i]
+        const id = allocateOverlayId('marker', null)
+        const snap: MarkerSnapshot = { oid: id, lat: pt.lat, lng: pt.lng, title: '', snippet: '', hidden: false }
+        markerSnapshots.push(snap)
+        ids.push(id)
     }
+    rebuildMarkerSource()
     return ids
 }
 
@@ -994,31 +1340,10 @@ export function clearOverlays(): void {
     clearImageOverlaysInternal()
     // v1.9.0: 清除 styled 折线（style 层系，同上）
     clearStyledPolylinesInternal()
-    const m = mapLibreMap
-    if (m == null) {
-        clearOverlayType('polyline')
-        clearOverlayType('circle')
-        clearOverlayType('rectangle')
-        polylineList = []
-        circleList = []
-        rectangleList = []
-        return
-    }
-    for (let i = 0; i < polylineList.length; i++) {
-        m.removePolyline(polylineList[i])
-    }
-    polylineList = []
-    clearOverlayType('polyline')
-    for (let i = 0; i < circleList.length; i++) {
-        m.removePolygon(circleList[i])
-    }
-    circleList = []
-    clearOverlayType('circle')
-    for (let i = 0; i < rectangleList.length; i++) {
-        m.removePolygon(rectangleList[i])
-    }
-    rectangleList = []
-    clearOverlayType('rectangle')
+    // v1.10.0: shape 层系其余三类（polyline/circle/rectangle）
+    removeVectorOverlaysByKind('polyline')
+    removeVectorOverlaysByKind('circle')
+    removeVectorOverlaysByKind('rectangle')
 }
 
 // 地图截图（异步回调）
@@ -1097,11 +1422,15 @@ export function destroyMap(): void {
     markerClickCallback = null
     mapLongClickCallback = null
     cameraChangeCallback = null
-    markerList = []
-    polygonList = []
-    polylineList = []
-    circleList = []
-    rectangleList = []
+    // v1.10.0: style 层系覆盖物状态（source/layer 随 style 销毁，仅清引用与快照）
+    markerSnapshots = []
+    labelSnapshots = []
+    vectorSnapshots = []
+    markerSourceRef = null
+    markerLayerRef = null
+    labelSourceRef = null
+    labelLayerRef = null
+    markerBitmapRegistered = false
     overlayMap = new Map<number, OverlayEntry>()
     overlayIdCounter = 0
     currentApiKey = ''
@@ -1324,7 +1653,7 @@ function clearOverlayType(type: string): void {
     }
 }
 
-// context7 验证：removePolygon/removePolyline/removeMarker 均为 MapLibreMap 方法
+// v1.10.0: 覆盖物统一为 style 层系——marker/label 走共享层快照，shape 走独立 source+layer
 export function removeOverlay(id: number): void {
     const entry = overlayMap.get(id)
     if (entry == null) return
@@ -1335,24 +1664,37 @@ export function removeOverlay(id: number): void {
         // v1.9.0: 图片覆盖物加载中即被移除——同步清理扩展状态（解码回调将因 entry 缺失而丢弃）
         imageOverlayExt.delete(id)
         imageOverlayIds = imageOverlayIds.filter(x => x != id)
+        // v1.10.0: marker/label/shape 快照同步剔除（共享层重建/重放时不再包含）
+        markerSnapshots = markerSnapshots.filter(s => s.oid != id)
+        labelSnapshots = labelSnapshots.filter(s => s.oid != id)
+        vectorSnapshots = vectorSnapshots.filter(s => s.oid != id)
         return
     }
     try {
-        if (entry.type == 'marker' || entry.type == 'label') {
-            m.removeMarker(ref as Marker)
-            markerList = markerList.filter(mk => mk !== ref)
-        } else if (entry.type == 'polygon') {
-            m.removePolygon(ref as Polygon)
-            polygonList = polygonList.filter(p => p !== ref)
-        } else if (entry.type == 'circle') {
-            m.removePolygon(ref as Polygon)
-            circleList = circleList.filter(c => c !== ref)
-        } else if (entry.type == 'rectangle') {
-            m.removePolygon(ref as Polygon)
-            rectangleList = rectangleList.filter(r => r !== ref)
-        } else if (entry.type == 'polyline') {
-            m.removePolyline(ref as Polyline)
-            polylineList = polylineList.filter(p => p !== ref)
+        if (entry.type == 'marker') {
+            markerSnapshots = markerSnapshots.filter(s => s.oid != id)
+            rebuildMarkerSource()
+        } else if (entry.type == 'label') {
+            const styleL = m.getStyle()
+            if (styleL != null) {
+                try { styleL.removeImage(labelIconName(id)) } catch (e2: any) { }
+            }
+            labelSnapshots = labelSnapshots.filter(s => s.oid != id)
+            rebuildLabelSource()
+        } else if (entry.type == 'polygon' || entry.type == 'circle' || entry.type == 'rectangle' || entry.type == 'polyline') {
+            const style = m.getStyle()
+            const shapeRef = ref as ShapeOverlayRef
+            if (style != null) {
+                try {
+                    for (let j = 0; j < shapeRef.layers.length; j++) {
+                        style.removeLayer(shapeRef.layers[j] as Layer)
+                    }
+                    style.removeSource("tdt-shape-src-" + id.toString())
+                } catch (e2: any) {
+                    console.error("TDTMap: removeOverlay shape 移除失败: " + e2.message)
+                }
+            }
+            vectorSnapshots = vectorSnapshots.filter(s => s.oid != id)
         } else if (entry.type == 'styledPolyline') {
             // v1.9.0: styled 折线为 style 层系（source+layer），非 annotation 体系
             const style = m.getStyle()
@@ -1389,44 +1731,30 @@ export function removeOverlay(id: number): void {
     imageOverlayIds = imageOverlayIds.filter(x => x != id)
 }
 
-// context7 + Exa 验证（maplibre-android-sdk 11.8.1 源码/官方 API 文档）：
-// - Polyline/Polygon 有 setAlpha(float)；Marker 无 setAlpha（Annotation 基类已移除 alpha/visible API）
-// - Marker 显隐通过 removeMarker + addMarker 重建实现（移除后 Marker 对象仍保留 position/title/snippet）
+// v1.10.0: marker/label 共享层模式（nativeRef 恒 null）——快照 hidden 即意图位，
+// 改数组重建 source 即生效，杜绝 legacy「建层前 hide 被吞」的时序问题
 export function showOverlay(id: number): void {
     const entry = overlayMap.get(id)
     if (entry == null) return
-    // 意图先行（v1.9.3）：本机路径图片覆盖物 nativeRef 为异步回填，ref 尚空时也要
-    // 记录显示意图——attach 时按 entry.isVisible 初始化层可见性，避免「建层后立即
-    // show」被静默丢弃导致帧层永远 NONE（雨汛通色斑/回波图空白踩坑实录）
+    // 意图先行（v1.9.3）：ref 尚空时也记录显示意图，attach/建层时生效
     entry.isVisible = true
+    if (entry.type == 'marker') {
+        setMarkerSnapshotHidden(id, false)
+        return
+    }
+    if (entry.type == 'label') {
+        setLabelSnapshotHidden(id, false)
+        return
+    }
     try {
         const ref = entry.nativeRef
         if (ref != null) {
-            if (entry.type == 'marker' || entry.type == 'label') {
-                const mk = ref as Marker
-                const m = mapLibreMap
-                // 已从地图移除的标记需重建后重新添加
-                if (m != null && markerList.indexOf(mk) < 0) {
-                    const pos = mk.getPosition()
-                    if (pos != null) {
-                        let title = mk.getTitle()
-                        if (title == null) {
-                            title = ''
-                        }
-                        const opts = new MarkerOptions()
-                            .position(pos)
-                            .title(title)
-                        const snip = mk.getSnippet()
-                        if (snip != null && snip.length > 0) {
-                            opts.snippet(snip)
-                        }
-                        const newMk = m.addMarker(opts)
-                        entry.nativeRef = newMk
-                        markerList.push(newMk)
-                    }
+            if (entry.type == 'polygon' || entry.type == 'circle' || entry.type == 'rectangle' || entry.type == 'polyline') {
+                const shapeRef = ref as ShapeOverlayRef
+                for (let j = 0; j < shapeRef.layers.length; j++) {
+                    (shapeRef.layers[j] as Layer).setProperties(PropertyFactory.visibility(Property.VISIBLE))
                 }
-            } else if (entry.type == 'polyline') {
-                (ref as Polyline).setAlpha(1.0.toFloat())
+                setVectorSnapshotVisible(id, true)
             } else if (entry.type == 'styledPolyline') {
                 // v1.9.0: maplibre 11.x Layer 无 setVisible，可见性走 visibility layout property
                 (ref as StyledPolylineEntry).layer.setProperties(PropertyFactory.visibility(Property.VISIBLE))
@@ -1435,8 +1763,6 @@ export function showOverlay(id: number): void {
                 ((ref as ImageOverlayExt).layer as RasterLayer).setProperties(PropertyFactory.visibility(Property.VISIBLE))
                 const extShow = imageOverlayExt.get(id)
                 if (extShow != null) extShow.params.visible = true
-            } else {
-                (ref as Polygon).setAlpha(1.0.toFloat())
             }
             entry.isVisible = true
         }
@@ -1448,21 +1774,26 @@ export function showOverlay(id: number): void {
 export function hideOverlay(id: number): void {
     const entry = overlayMap.get(id)
     if (entry == null) return
-    // 意图先行（v1.9.3，对称 showOverlay）：ref 尚空时记录隐藏意图，attach 时生效
+    // 意图先行（v1.9.3，对称 showOverlay）：ref 尚空时记录隐藏意图，attach/建层时生效
     entry.isVisible = false
+    if (entry.type == 'marker') {
+        // hidden 快照剔除出 source 数据 → 点击检测天然不命中（对齐 legacy 移出 markerList 防误命中）
+        setMarkerSnapshotHidden(id, true)
+        return
+    }
+    if (entry.type == 'label') {
+        setLabelSnapshotHidden(id, true)
+        return
+    }
     try {
         const ref = entry.nativeRef
         if (ref != null) {
-            if (entry.type == 'marker' || entry.type == 'label') {
-                const mk = ref as Marker
-                const m = mapLibreMap
-                // 从地图移除并移出 markerList，避免点击检测误命中已隐藏标记
-                if (m != null && markerList.indexOf(mk) >= 0) {
-                    m.removeMarker(mk)
-                    markerList = markerList.filter(item => item !== mk)
+            if (entry.type == 'polygon' || entry.type == 'circle' || entry.type == 'rectangle' || entry.type == 'polyline') {
+                const shapeRef = ref as ShapeOverlayRef
+                for (let j = 0; j < shapeRef.layers.length; j++) {
+                    (shapeRef.layers[j] as Layer).setProperties(PropertyFactory.visibility(Property.NONE))
                 }
-            } else if (entry.type == 'polyline') {
-                (ref as Polyline).setAlpha(0.0.toFloat())
+                setVectorSnapshotVisible(id, false)
             } else if (entry.type == 'styledPolyline') {
                 // v1.9.0: maplibre 11.x Layer 无 setVisible，可见性走 visibility layout property
                 (ref as StyledPolylineEntry).layer.setProperties(PropertyFactory.visibility(Property.NONE))
@@ -1471,8 +1802,6 @@ export function hideOverlay(id: number): void {
                 ((ref as ImageOverlayExt).layer as RasterLayer).setProperties(PropertyFactory.visibility(Property.NONE))
                 const extHide = imageOverlayExt.get(id)
                 if (extHide != null) extHide.params.visible = false
-            } else {
-                (ref as Polygon).setAlpha(0.0.toFloat())
             }
             entry.isVisible = false
         }
@@ -1491,7 +1820,7 @@ export function hideOverlay(id: number): void {
 export function setMarkerClickCallback(callback: MarkerClickCallback): void {
     markerClickCallback = callback
     // 标记点击检测逻辑已合并到 initMap 的 OnMapClickListener 中（见 initMap 中的 Priority 1 检查）。
-    // 闭包通过模块级变量 markerClickCallback 和 markerList 访问最新引用，
+    // 闭包通过模块级变量 markerClickCallback 和共享层引用（markerLayerRef/labelLayerRef）访问最新状态，
     // 因此用户在不同时机调用 setMarkerClickCallback 均能生效。
 }
 
@@ -1997,37 +2326,16 @@ function doGetLocationInternal(ctx: Context, callback: (detail: MapClickDetail) 
 // v1.3.0 新增：信息窗口
 // ══════════════════════════════════════════════
 
-// context7 验证：Android 废弃 Marker API 支持 showInfoWindow(MapLibreMap, MapView)
+// v1.10.0: no-op——MapLibre 11.x native-view 集成下 InfoWindow 实测不显示（v1.5.6 结论，
+// 调用无异常但气泡永不渲染），且 annotations→layer 迁移后无原生气泡等价物；
+// 信息气泡由组件层自绘实现（tdt-map.uvue v1.5.6 Web Mercator 随相机重算）。
+// 保留函数签名以维持 interface.uts 契约（Web/iOS 端仍为原生实现）
 export function showMarkerInfo(id: number): void {
-    const entry = overlayMap.get(id)
-    if (entry == null) return
-    if (entry.type == 'marker' || entry.type == 'label') {
-        const mk = entry.nativeRef as Marker
-        const mm = mapLibreMap
-        const mv = mapView
-        if (mm == null || mv == null) {
-            console.warn("TDTMap: showMarkerInfo - 地图未就绪")
-            return
-        }
-        try {
-            mk.showInfoWindow(mm, mv)
-        } catch (e: any) {
-            console.error("TDTMap: showMarkerInfo 失败: " + e.message)
-        }
-    }
+    console.log("TDTMap: [DIAG] showMarkerInfo no-op（layer 迁移；组件层自绘气泡生效）id=" + id)
 }
 
 export function hideMarkerInfo(id: number): void {
-    const entry = overlayMap.get(id)
-    if (entry == null) return
-    if (entry.type == 'marker' || entry.type == 'label') {
-        const mk = entry.nativeRef as Marker
-        try {
-            mk.hideInfoWindow()
-        } catch (e: any) {
-            console.error("TDTMap: hideMarkerInfo 失败: " + e.message)
-        }
-    }
+    console.log("TDTMap: [DIAG] hideMarkerInfo no-op id=" + id)
 }
 
 // ════════════════════════════════════════════
@@ -2630,6 +2938,55 @@ function rebuildUserLayersAfterStyle(): void {
                     console.error("TDTMap: 图片覆盖物重建失败 id=" + oid + ": " + e.message)
                     overlayMap.delete(oid)
                 }
+            }
+        }
+    }
+    // v1.10.0: 六类注记类覆盖物重放（快照→重建→恢复可见性，仿 image 三段式）。
+    // annotation 时代独立于 style 生命周期（setStyle 后自动存活），layer 不存活——不加重放则切换底图后全部消失
+    const stShape = mapLibreMap?.getStyle()
+    if (stShape != null) {
+        // 1) shape 四类：按添加序重放（保持原 ID）；hide 过的建层后立即 NONE（不能因重建复现）
+        if (vectorSnapshots.length > 0) {
+            const savedShapes = vectorSnapshots.slice()
+            vectorSnapshots = []
+            for (let i = 0; i < savedShapes.length; i++) {
+                const s = savedShapes[i]
+                if (attachShapeOverlayToStyle(s.oid, s.kind, s.points, s.color, s.fillColor, s.width) && !s.visible) {
+                    const entryS = overlayMap.get(s.oid)
+                    const refAnyS = entryS != null ? entryS.nativeRef : null
+                    if (refAnyS != null) {
+                        const shr = refAnyS as ShapeOverlayRef
+                        for (let j = 0; j < shr.layers.length; j++) {
+                            (shr.layers[j] as Layer).setProperties(PropertyFactory.visibility(Property.NONE))
+                        }
+                    }
+                    const entryS2 = overlayMap.get(s.oid)
+                    if (entryS2 != null) { entryS2.isVisible = false }
+                }
+            }
+        }
+        // 2) marker：新 style 位图表已清空——强制重注册图钉 + 重建共享层 + 数据重放
+        if (markerSnapshots.length > 0) {
+            markerBitmapRegistered = false
+            markerSourceRef = null
+            markerLayerRef = null
+            if (ensureMarkerStyle(stShape)) {
+                rebuildMarkerSource()
+            }
+        }
+        // 3) label：层引用重置 + 逐 snapshot 重画位图注册 + 数据重放
+        if (labelSnapshots.length > 0) {
+            labelSourceRef = null
+            labelLayerRef = null
+            if (ensureLabelStyle(stShape)) {
+                for (let i = 0; i < labelSnapshots.length; i++) {
+                    try {
+                        registerLabelBitmap(stShape, labelSnapshots[i].oid, labelSnapshots[i].text)
+                    } catch (e: any) {
+                        console.error("TDTMap: label 位图重放失败 id=" + labelSnapshots[i].oid.toString() + ": " + e.message)
+                    }
+                }
+                rebuildLabelSource()
             }
         }
     }
