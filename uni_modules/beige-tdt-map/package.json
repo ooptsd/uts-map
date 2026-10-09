@@ -1,7 +1,7 @@
 {
   "id": "beige-tdt-map",
   "name": "天地图UTS原生插件（uni-app x 蒸汽模式）",
-  "version": "1.9.0",
+  "version": "1.9.2",
   "description": "天地图UTS原生插件，GPU渲染，Android/iOS/鸿蒙/Web四端统一。支持矢量影像地形切换、定位、标记与覆盖物、天地图搜索、坐标转换、截图、手势控制",
   "uni_modules": {
     "dependencies": [],

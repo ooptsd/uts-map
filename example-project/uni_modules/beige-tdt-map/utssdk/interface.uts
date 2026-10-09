@@ -326,6 +326,16 @@ export declare function setGeoJsonReplayCallback(callback: GeoJsonReplayCallback
 // opacity 并入颜色 alpha 通道。返回 overlay ID（0=失败），与 removeOverlay/showOverlay/hideOverlay 统一管理
 export declare function addStyledPolyline(points: Array<MapClickDetail>, color: string, width: number, dash: Array<number> | null, opacity?: number): number
 
+// 批量 styled 折线（v1.9.2，GeoJSON 层编排专用）：多条线一次调用建一个渲染层。
+// 入参扁平化：points 为全部线点顺序串联（每 ringLengths[i] 个点为一环，长度≥2 才有效），
+// 规避嵌套类型数组跨端桥接丢内层类型（Array<Array<MapClickDetail>> 实测内层变 UTSJSONObject）。
+// Android=单 GeoJsonSource(MultiLineString)+单 LineLayer；iOS=MLNMultiPolyline+单 MLNLineStyleLayer；
+// Web=单 GeoJSON source(MultiLineString)+line 层；鸿蒙 MapKit 无多段线，原语内部逐线 addPolyline
+// （省桥接开销，overlay ID 单个、nativeRef 持线数组，type='styledPolylineBatch' 独立管理分支）。
+// 样式参数语义与 addStyledPolyline 完全一致（整批统一 color/width/dash/opacity）；
+// 有效环数为 0 返回 0。单线原语保留不动（demo/少量场景直用）
+export declare function addStyledPolylineBatch(points: Array<MapClickDetail>, ringLengths: Array<number>, color: string, width: number, dash: Array<number> | null, opacity?: number): number
+
 // styled 文本选项（E0.3b）：fontSize 单位 px；haloColor 支持 #rrggbb / #rrggbbaa
 // （半透明格式 alpha 在后，MapLibre style spec 约定；注意与既有 fillColor 的 #aarrggbb 约定不同）
 export type StyledTextOptions = {

@@ -619,6 +619,50 @@ export function addStyledPolyline(points: Array<MapClickDetail>, color: string, 
     }
 }
 
+// v1.9.2: 批量 styled 折线——全部环进一个 MLNMultiPolyline，单 MLNShapeSource+单 MLNLineStyleLayer
+// （样式参数与单线版一致；管理面复用 polylines 数组 {source,layer} 条目，零新增管理分支）
+export function addStyledPolylineBatch(points: Array<MapClickDetail>, ringLengths: Array<number>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+    if (mapView == null || mapView.style == null || points.length == 0 || ringLengths.length == 0) return 0
+    const lineId = "tdt-styled-line-" + polylines.length.toString()
+    try {
+        const polys: Array<MLNPolyline> = []
+        let offset = 0
+        for (let i = 0; i < ringLengths.length; i++) {
+            const len = ringLengths[i].toInt()
+            if (len < 2 || offset + len > points.length) {
+                offset += len
+                continue
+            }
+            const coordinates: Array<CLLocationCoordinate2D> = []
+            for (let j = 0; j < len; j++) {
+                coordinates.push(CLLocationCoordinate2DMake(points[offset + j].lat, points[offset + j].lng))
+            }
+            polys.push(MLNPolyline(coordinates, len))
+            offset += len
+        }
+        if (polys.length == 0) return 0
+        const multi = MLNMultiPolyline(polys)
+        const source = new MLNShapeSource(lineId, multi, null)
+        mapView.style?.addSource(source)
+        const layer = new MLNLineStyleLayer(lineId + "-layer", source)
+        layer.lineColor = NSExpression(forConstantValue: parseColor(color))
+        layer.lineWidth = NSExpression(forConstantValue: width)
+        layer.lineOpacity = NSExpression(forConstantValue: opacity ?? 1.0)
+        if (dash != null && dash.length > 0) {
+            layer.lineDashpattern = NSExpression(forConstantValue: dash)
+        }
+        mapView.style?.addLayer(layer)
+        const entry = { source: source, layer: layer }
+        polylines.push(entry)
+        return allocateOverlayId('styledPolyline', entry)
+    } catch (e) {
+        if (onErrorCallback != null) {
+            onErrorCallback({ code: 4, message: "添加批量 styled 折线失败: " + e.toString() })
+        }
+        return 0
+    }
+}
+
 // ══════════════════════════════════════════════
 // v1.9.0 新增：E0.3b styled 文本（基线=文字转位图 E0.3b-F）
 // ══════════════════════════════════════════════

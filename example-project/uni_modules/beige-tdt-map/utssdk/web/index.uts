@@ -936,6 +936,40 @@ export function addStyledPolyline(points: Array<MapClickDetail>, color: string, 
     return id
 }
 
+// v1.9.2: 批量 styled 折线——全部环进一个 MultiLineString，单 GeoJSON source+单 line 层
+// （样式参数与单线版一致；单 id 进 polylineList，管理面零变化）
+export function addStyledPolylineBatch(points: Array<MapClickDetail>, ringLengths: Array<number>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+    if (mapInstance == null || points.length == 0 || ringLengths.length == 0) return 0
+    const lines: Array<Array<Array<number>>> = []
+    let offset = 0
+    for (let i = 0; i < ringLengths.length; i++) {
+        const len = ringLengths[i].toInt()
+        if (len < 2 || offset + len > points.length) {
+            offset += len
+            continue
+        }
+        const coords: Array<Array<number>> = []
+        for (let j = 0; j < len; j++) {
+            coords.push([points[offset + j].lng, points[offset + j].lat])
+        }
+        lines.push(coords)
+        offset += len
+    }
+    if (lines.length == 0) return 0
+    const paint: any = {
+        'line-color': color,
+        'line-width': width,
+        'line-opacity': opacity ?? 1
+    }
+    if (dash != null && dash.length > 0) {
+        paint['line-dasharray'] = dash
+    }
+    const geojson: any = { type: 'Feature', geometry: { type: 'MultiLineString', coordinates: lines } }
+    const id = addGeoJSONOverlay('line', geojson, paint)
+    if (id > 0) polylineList.push(id)
+    return id
+}
+
 export function addCircle(lat: number, lng: number, radius: number, color: string, fillColor: string): number {
     // 用 GeoJSON circle 近似：多个点模拟圆
     const coords: Array<Array<number>> = []

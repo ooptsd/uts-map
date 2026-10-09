@@ -705,6 +705,59 @@ export function addStyledPolyline(points: Array<MapClickDetail>, color: string, 
     return id
 }
 
+// v1.9.2: 批量 styled 折线——鸿蒙 MapKit 无多段线几何，原语内部逐线 addPolyline
+// （省 N 次跨端桥接与 ID 分配；样式参数与单线版一致，dash 仍降级实线）。
+// 单个 overlay ID 管整批：type='styledPolylineBatch'，nativeRef=线数组（remove/show/hide 有独立分支）；
+// 各线同时入全局 polylines 数组（clearOverlays 横扫兜底，逐条 remove 后再过滤）
+export function addStyledPolylineBatch(points: Array<MapClickDetail>, ringLengths: Array<number>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+    if (mapController == null || points.length == 0 || ringLengths.length == 0) return 0
+    if (dash != null && dash.length > 0 && !styledDashWarned) {
+        styledDashWarned = true
+        console.warn("TDTMap: 鸿蒙 MapKit 折线不支持虚线（MapPolylineOptions 无 dash 参数），已降级实线")
+    }
+    overlayIdCounter++
+    const id = overlayIdCounter
+    const refs: Array<map.MapPolyline> = []
+    const entry: OverlayEntry = { id: id, type: 'styledPolylineBatch', nativeRef: refs as any | null, isVisible: true }
+    overlayMap.set(id, entry)
+    const colorNum = applyOpacityToColor(parseColorHex(color), opacity ?? 1)
+    let added = 0
+    let offset = 0
+    for (let i = 0; i < ringLengths.length; i++) {
+        const len = ringLengths[i].toInt()
+        if (len < 2 || offset + len > points.length) {
+            offset += len
+            continue
+        }
+        const latLngs: Array<mapCommon.LatLng> = []
+        for (let j = 0; j < len; j++) {
+            const ll: mapCommon.LatLng = { latitude: points[offset + j].lat, longitude: points[offset + j].lng }
+            latLngs.push(ll)
+        }
+        const polylineOpts: mapCommon.MapPolylineOptions = {
+            points: latLngs,
+            color: colorNum,
+            width: width,
+            visible: true
+        }
+        added++
+        mapController.addPolyline(polylineOpts).then((polyline: map.MapPolyline) => {
+            if (polyline != null) {
+                refs.push(polyline)
+                polylines.push(polyline)
+            }
+        }).catch((e: Error) => {
+            console.error("TDTMap: 批量 styled 折线单线失败: " + ((e as Error).message ?? String(e)))
+        })
+        offset += len
+    }
+    if (added == 0) {
+        overlayMap.delete(id)
+        return 0
+    }
+    return id
+}
+
 // v1.9.0: E0.3b styled 文本——鸿蒙降级档：MapKit 无离屏文字位图管线（UTS 侧无已验证的
 // drawing/render 通道），且 MapKit 注记 title 非常显文本（与 Android 同需交互触发）。
 // 按子模块平台差异惯例显式上报（console.warn + code=5）并返回 0（无地名降级档，登记偏差）；
@@ -1228,6 +1281,20 @@ export function removeOverlay(id: number): void {
         imageOverlayIds = imageOverlayIds.filter(x => x != id)
         return
     }
+    // v1.9.2: 批量 styled 折线——nativeRef 为线数组，逐条 remove 后过滤全局 polylines
+    if (entry.type == 'styledPolylineBatch') {
+        const refs = ref as Array<map.MapPolyline>
+        try {
+            for (let i = 0; i < refs.length; i++) {
+                refs[i].remove()
+            }
+        } catch (e) {
+            console.error("TDTMap: removeOverlay 失败: " + ((e as Error).message ?? String(e)))
+        }
+        polylines = polylines.filter(p => refs.indexOf(p) < 0)
+        overlayMap.delete(id)
+        return
+    }
     try {
         ref.remove()
     } catch (e) {
@@ -1267,6 +1334,19 @@ export function showOverlay(id: number): void {
     if (entry == null) return
     const ref = entry.nativeRef
     if (ref == null || entry.isVisible) return
+    // v1.9.2: 批量 styled 折线——nativeRef 为线数组，逐线 setVisible
+    if (entry.type == 'styledPolylineBatch') {
+        const refs = ref as Array<map.MapPolyline>
+        try {
+            for (let i = 0; i < refs.length; i++) {
+                refs[i].setVisible(true)
+            }
+            entry.isVisible = true
+        } catch (e) {
+            console.error("TDTMap: showOverlay 失败: " + ((e as Error).message ?? String(e)))
+        }
+        return
+    }
     try {
         ref.setVisible(true)
         entry.isVisible = true
@@ -1280,6 +1360,19 @@ export function hideOverlay(id: number): void {
     if (entry == null) return
     const ref = entry.nativeRef
     if (ref == null || !entry.isVisible) return
+    // v1.9.2: 批量 styled 折线——nativeRef 为线数组，逐线 setVisible
+    if (entry.type == 'styledPolylineBatch') {
+        const refs = ref as Array<map.MapPolyline>
+        try {
+            for (let i = 0; i < refs.length; i++) {
+                refs[i].setVisible(false)
+            }
+            entry.isVisible = false
+        } catch (e) {
+            console.error("TDTMap: hideOverlay 失败: " + ((e as Error).message ?? String(e)))
+        }
+        return
+    }
     try {
         ref.setVisible(false)
         entry.isVisible = false

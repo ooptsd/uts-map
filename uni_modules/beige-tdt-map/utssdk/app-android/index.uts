@@ -701,6 +701,69 @@ export function addStyledPolyline(points: Array<MapClickDetail>, color: string, 
     }
 }
 
+// v1.9.2: 批量 styled 折线——全部环进一个 MultiLineString，单 source+单 layer 一次渲染
+// （百环级边界图层从 N 次 addSource/addLayer 降为 1 次，实测 UI 阻塞从秒级降到毫秒级）；
+// 几何以 GeoJSON 字符串直构后交 GeoJsonSource(id, String) 原生解析——绕开 UTS→Kotlin 嵌套
+// 泛型桥接（List<List<Point>> 重载不可达，kotlin 编译 error25 实测）；样式语义与单线版一致；
+// 管理面复用 styledPolylines 数组与 'styledPolyline' 类型（同为 {source,layer} 单条目）
+export function addStyledPolylineBatch(points: Array<MapClickDetail>, ringLengths: Array<number>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+    const m = mapLibreMap
+    const style = m?.getStyle()
+    if (m == null || style == null || points.length == 0 || ringLengths.length == 0) return 0
+    const errorCb = onErrorCallback
+    overlayIdCounter++
+    const id = overlayIdCounter
+    const sourceId = "styled-line-src-" + id
+    const layerId = "styled-line-layer-" + id
+    try {
+        let json = "{\"type\":\"MultiLineString\",\"coordinates\":["
+        let appended = 0
+        let offset = 0
+        for (let i = 0; i < ringLengths.length; i++) {
+            const len = ringLengths[i].toInt()
+            if (len < 2 || offset + len > points.length) {
+                offset += len
+                continue
+            }
+            if (appended > 0) json += ","
+            json += "["
+            for (let j = 0; j < len; j++) {
+                if (j > 0) json += ","
+                const pt = points[offset + j]
+                json += "[" + pt.lng.toDouble().toString() + "," + pt.lat.toDouble().toString() + "]"
+            }
+            json += "]"
+            appended++
+            offset += len
+        }
+        if (appended == 0) return 0
+        json += "]}"
+        const source = new GeoJsonSource(sourceId, json)
+        style.addSource(source)
+        const layer = new LineLayer(layerId, sourceId)
+        layer.setProperties(
+            PropertyFactory.lineColor(Color.parseColor(color)),
+            PropertyFactory.lineWidth(width.toFloat()),
+            PropertyFactory.lineOpacity((opacity ?? 1.0).toFloat())
+        )
+        if (dash != null && dash.length > 0) {
+            layer.setProperties(PropertyFactory.lineDasharray(Expression.literal(dash.toTypedArray())))
+        }
+        style.addLayer(layer)
+        const entryObj: StyledPolylineEntry = { source: source, layer: layer }
+        styledPolylines.push(entryObj)
+        overlayMap.set(id, { id: id, type: 'styledPolyline', nativeRef: entryObj, isVisible: true })
+        return id
+    } catch (e: any) {
+        console.error("TDTMap: 添加批量 styled 折线失败: " + e.message)
+        overlayMap.delete(id)
+        if (errorCb != null) {
+            errorCb({ code: 4, message: "添加批量 styled 折线失败: " + e.message })
+        }
+        return 0
+    }
+}
+
 // 清除全部 styled 折线（clearOverlays 调用；style 为空时仅清状态）
 function clearStyledPolylinesInternal(): void {
     const style = mapLibreMap?.getStyle()

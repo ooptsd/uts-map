@@ -9,7 +9,7 @@ import { Expression } from "org.maplibre.android.style.expressions"
 import { GeoJsonSource, GeoJsonOptions } from "org.maplibre.android.style.sources"
 import { CircleLayer, SymbolLayer, HeatmapLayer } from "org.maplibre.android.style.layers"
 // v1.9.0: E0.3a styled 折线（LineLayer + GeoJsonSource）
-import { LineLayer } from "org.maplibre.android.style.layers"
+import { LineLayer, Layer } from "org.maplibre.android.style.layers"
 import { FeatureCollection, Feature, Point, LineString } from "org.maplibre.geojson"
 import { JsonObject } from "com.google.gson"
 import { CameraPosition, CameraUpdateFactory } from "org.maplibre.android.camera"
@@ -76,7 +76,7 @@ let overlayMap = new Map<number, OverlayEntry>()
 type OverlayEntry = {
     id: number
     type: string  // 'marker' | 'polygon' | 'polyline' | 'circle' | 'rectangle' | 'label' | 'image'
-    nativeRef: any  // Marker | Polygon | Polyline | {source, layer}（image 为 source+layer 包装）
+    nativeRef: any | null  // Marker | Polygon | Polyline | {source, layer}（image 为 source+layer 包装；styledText/image 加载中可为 null，attach 后回填）
     isVisible: boolean
 }
 
@@ -109,7 +109,7 @@ let perfRenderMaxEncode = 0.0
 let perfRenderMaxRender = 0.0
 
 // 分配 overlay ID 并存入追踪表
-function allocateOverlayId(type: string, nativeRef: any): number {
+function allocateOverlayId(type: string, nativeRef: any | null): number {
     overlayIdCounter++
     const id = overlayIdCounter
     overlayMap.set(id, { id: id, type: type, nativeRef: nativeRef, isVisible: true })
@@ -671,7 +671,8 @@ export function addStyledPolyline(points: Array<MapClickDetail>, color: string, 
         for (let i = 0; i < points.length; i++) {
             coords.push(Point.fromLngLat(points[i].lng.toDouble(), points[i].lat.toDouble()))
         }
-        const source = new GeoJsonSource(sourceId, LineString.fromLngLat(coords))
+        // UTS Array 非 kotlin List；maplibre LineString 工厂为 fromLngLats（复数，Point 才是 fromLngLat）
+        const source = new GeoJsonSource(sourceId, LineString.fromLngLats(coords.toKotlinList()))
         style.addSource(source)
         const layer = new LineLayer(layerId, sourceId)
         layer.setProperties(
@@ -695,6 +696,69 @@ export function addStyledPolyline(points: Array<MapClickDetail>, color: string, 
         overlayMap.delete(id)
         if (errorCb != null) {
             errorCb({ code: 4, message: "添加 styled 折线失败: " + e.message })
+        }
+        return 0
+    }
+}
+
+// v1.9.2: 批量 styled 折线——全部环进一个 MultiLineString，单 source+单 layer 一次渲染
+// （百环级边界图层从 N 次 addSource/addLayer 降为 1 次，实测 UI 阻塞从秒级降到毫秒级）；
+// 几何以 GeoJSON 字符串直构后交 GeoJsonSource(id, String) 原生解析——绕开 UTS→Kotlin 嵌套
+// 泛型桥接（List<List<Point>> 重载不可达，kotlin 编译 error25 实测）；样式语义与单线版一致；
+// 管理面复用 styledPolylines 数组与 'styledPolyline' 类型（同为 {source,layer} 单条目）
+export function addStyledPolylineBatch(points: Array<MapClickDetail>, ringLengths: Array<number>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+    const m = mapLibreMap
+    const style = m?.getStyle()
+    if (m == null || style == null || points.length == 0 || ringLengths.length == 0) return 0
+    const errorCb = onErrorCallback
+    overlayIdCounter++
+    const id = overlayIdCounter
+    const sourceId = "styled-line-src-" + id
+    const layerId = "styled-line-layer-" + id
+    try {
+        let json = "{\"type\":\"MultiLineString\",\"coordinates\":["
+        let appended = 0
+        let offset = 0
+        for (let i = 0; i < ringLengths.length; i++) {
+            const len = ringLengths[i].toInt()
+            if (len < 2 || offset + len > points.length) {
+                offset += len
+                continue
+            }
+            if (appended > 0) json += ","
+            json += "["
+            for (let j = 0; j < len; j++) {
+                if (j > 0) json += ","
+                const pt = points[offset + j]
+                json += "[" + pt.lng.toDouble().toString() + "," + pt.lat.toDouble().toString() + "]"
+            }
+            json += "]"
+            appended++
+            offset += len
+        }
+        if (appended == 0) return 0
+        json += "]}"
+        const source = new GeoJsonSource(sourceId, json)
+        style.addSource(source)
+        const layer = new LineLayer(layerId, sourceId)
+        layer.setProperties(
+            PropertyFactory.lineColor(Color.parseColor(color)),
+            PropertyFactory.lineWidth(width.toFloat()),
+            PropertyFactory.lineOpacity((opacity ?? 1.0).toFloat())
+        )
+        if (dash != null && dash.length > 0) {
+            layer.setProperties(PropertyFactory.lineDasharray(Expression.literal(dash.toTypedArray())))
+        }
+        style.addLayer(layer)
+        const entryObj: StyledPolylineEntry = { source: source, layer: layer }
+        styledPolylines.push(entryObj)
+        overlayMap.set(id, { id: id, type: 'styledPolyline', nativeRef: entryObj, isVisible: true })
+        return id
+    } catch (e: any) {
+        console.error("TDTMap: 添加批量 styled 折线失败: " + e.message)
+        overlayMap.delete(id)
+        if (errorCb != null) {
+            errorCb({ code: 4, message: "添加批量 styled 折线失败: " + e.message })
         }
         return 0
     }
@@ -770,11 +834,11 @@ export function addStyledText(lat: number, lng: number, text: string, options: S
             // halo 描边：加宽 stroke（haloWidth*2 补偿双向各半）先画后填充（Web/iOS 八方向偏移同视觉）
             paint.setStyle(Paint.Style.STROKE)
             paint.setStrokeWidth((haloWidthPx * 2).toFloat())
-            paint.setColor(parseStyledColor(options.haloColor))
+            paint.setColor(parseStyledColor(options.haloColor).toInt())
             canvas.drawText(text, pad.toFloat(), baselineY.toFloat(), paint)
         }
         paint.setStyle(Paint.Style.FILL)
-        paint.setColor(parseStyledColor(options.color))
+        paint.setColor(parseStyledColor(options.color).toInt())
         canvas.drawText(text, pad.toFloat(), baselineY.toFloat(), paint)
 
         // bounds 换算（当前 zoom 屏幕等尺寸）：256 tileSize 标准 worldPx 公式（组件层 latLngToScreen 同源）
@@ -792,8 +856,9 @@ export function addStyledText(lat: number, lng: number, text: string, options: S
         }
 
         // 复用图像叠加通路（type=styledText 与 image 同款 {source,layer} 管理；attach 回填 ext 供样式重建重放）
-        overlayIdCounter++
-        const id = overlayIdCounter
+        // allocateOverlayId 对齐 image 通路（null 占位 + attachImageOverlayToStyle 内回填 nativeRef，
+        // 避免 OverlayEntry.nativeRef 字面量直接传 null 触发非空 Any 编译错误）
+        const id = allocateOverlayId('styledText', null)
         const params: ImageOverlayOptions = {
             southwest: { lat: lat - halfLat, lng: lng - halfLng },
             northeast: { lat: lat + halfLat, lng: lng + halfLng },
@@ -803,7 +868,6 @@ export function addStyledText(lat: number, lng: number, text: string, options: S
             visible: true,
             clickable: false
         }
-        overlayMap.set(id, { id: id, type: 'styledText', nativeRef: null, isVisible: true })
         attachImageOverlayToStyle(id, params, style, bmp!)
         return id
     } catch (e: any) {
@@ -1304,10 +1368,16 @@ export function removeOverlay(id: number): void {
             styledPolylines = styledPolylines.filter(sp => sp !== spRef)
         } else if (entry.type == 'image' || entry.type == 'styledText') { // v1.9.0: styledText 同为 image 通路 {source,layer}
             // v1.9.0: 图片覆盖物为 style 层系（source+layer），非 annotation 体系
+            // any 上直接点访问报"找不到名称"，as ImageOverlayExt 收窄后取成员（对齐上方 styledPolyline 先例）
             const style = m.getStyle()
+            const imgRef = ref as ImageOverlayExt
             if (style != null) {
-                style.removeLayer(ref.layer as RasterLayer)
-                style.removeSource(ref.source as ImageSource)
+                try {
+                    style.removeLayer(imgRef.layer as RasterLayer)
+                    style.removeSource(imgRef.source as ImageSource)
+                } catch (e2: any) {
+                    console.error("TDTMap: removeOverlay 图片/styledText 移除失败: " + e2.message)
+                }
             }
         }
     } catch (e: any) {
@@ -1354,11 +1424,11 @@ export function showOverlay(id: number): void {
             } else if (entry.type == 'polyline') {
                 (ref as Polyline).setAlpha(1.0.toFloat())
             } else if (entry.type == 'styledPolyline') {
-                // v1.9.0: LineLayer 须用 Layer.setVisible（显式拦截，防落入末尾 Polygon 分支）
-                (ref as StyledPolylineEntry).layer.setVisible(true)
+                // v1.9.0: maplibre 11.x Layer 无 setVisible，可见性走 visibility layout property
+                (ref as StyledPolylineEntry).layer.setProperties(PropertyFactory.visibility(Property.VISIBLE))
             } else if (entry.type == 'image' || entry.type == 'styledText') { // v1.9.0: styledText 同为 image 通路 {source,layer}
-                // v1.9.0: RasterLayer 无 setAlpha，须用 Layer.setVisible（必须显式拦截，否则落入末尾 Polygon 分支）
-                (ref.layer as RasterLayer).setVisible(true)
+                // v1.9.0: RasterLayer 无 setAlpha，同走 visibility（必须显式拦截，否则落入末尾 Polygon 分支）
+                ((ref as ImageOverlayExt).layer as RasterLayer).setProperties(PropertyFactory.visibility(Property.VISIBLE))
                 const extShow = imageOverlayExt.get(id)
                 if (extShow != null) extShow.params.visible = true
             } else {
@@ -1388,11 +1458,11 @@ export function hideOverlay(id: number): void {
             } else if (entry.type == 'polyline') {
                 (ref as Polyline).setAlpha(0.0.toFloat())
             } else if (entry.type == 'styledPolyline') {
-                // v1.9.0: LineLayer 须用 Layer.setVisible（显式拦截，防落入末尾 Polygon 分支）
-                (ref as StyledPolylineEntry).layer.setVisible(false)
+                // v1.9.0: maplibre 11.x Layer 无 setVisible，可见性走 visibility layout property
+                (ref as StyledPolylineEntry).layer.setProperties(PropertyFactory.visibility(Property.NONE))
             } else if (entry.type == 'image' || entry.type == 'styledText') { // v1.9.0: styledText 同为 image 通路 {source,layer}
-                // v1.9.0: RasterLayer 无 setAlpha，须用 Layer.setVisible（必须显式拦截，否则落入末尾 Polygon 分支）
-                (ref.layer as RasterLayer).setVisible(false)
+                // v1.9.0: RasterLayer 无 setAlpha，同走 visibility（必须显式拦截，否则落入末尾 Polygon 分支）
+                ((ref as ImageOverlayExt).layer as RasterLayer).setProperties(PropertyFactory.visibility(Property.NONE))
                 const extHide = imageOverlayExt.get(id)
                 if (extHide != null) extHide.params.visible = false
             } else {
@@ -2024,10 +2094,10 @@ function hitTestImageOverlay(lat: number, lng: number, params: ImageOverlayOptio
 // 编译期验证项：LatLngQuad(LatLng...) vararg 在 UTS→Kotlin 下 4 参调用；若编译失败改 arrayOf 传参）
 function buildLatLngQuad(quad: Array<Array<number>>): LatLngQuad {
     return new LatLngQuad(
-        new LatLng(quad[0][1], quad[0][0]),
-        new LatLng(quad[1][1], quad[1][0]),
-        new LatLng(quad[2][1], quad[2][0]),
-        new LatLng(quad[3][1], quad[3][0])
+        new LatLng(quad[0][1].toDouble(), quad[0][0].toDouble()),
+        new LatLng(quad[1][1].toDouble(), quad[1][0].toDouble()),
+        new LatLng(quad[2][1].toDouble(), quad[2][0].toDouble()),
+        new LatLng(quad[3][1].toDouble(), quad[3][0].toDouble())
     )
 }
 
@@ -2045,7 +2115,7 @@ function decodeSampledBitmapFromFile(path: string, maxDim: number): any | null {
             sample = sample * 2
         }
         const opts = new BitmapFactory.Options()
-        opts.inSampleSize = sample
+        opts.inSampleSize = sample.toInt()
         return BitmapFactory.decodeFile(path, opts)
     } catch (e: any) {
         console.error("TDTMap: 图片解码失败: " + e.message)
@@ -2060,13 +2130,13 @@ function imageOverlayBeforeLayerIdAndroid(style: Style, newKey: number, excludeI
     if (layersRaw == null) return ''
     const layers = Array.fromNative(layersRaw)
     for (let j = 0; j < layers.length; j++) {
-        const lid = (layers[j] as any).getId() as string
+        const lid = (layers[j] as Layer).getId() as string
         for (let i = 0; i < imageOverlayIds.length; i++) {
             const oid = imageOverlayIds[i]
             if (oid == excludeId) continue
             const info = imageOverlayExt.get(oid)
             if (info == null) continue
-            if (info.layer.getId() == lid) {
+            if ((info.layer as Layer).getId() == lid) {
                 if (imageOverlayZKey(info.params.zIndex ?? null) > newKey) return lid
                 break
             }
@@ -2081,13 +2151,13 @@ function lowestImageLayerIdAndroid(style: Style, excludeId: number): string {
     if (layersRaw == null) return ''
     const layers = Array.fromNative(layersRaw)
     for (let j = 0; j < layers.length; j++) {
-        const lid = (layers[j] as any).getId() as string
+        const lid = (layers[j] as Layer).getId() as string
         for (let i = 0; i < imageOverlayIds.length; i++) {
             const oid = imageOverlayIds[i]
             if (oid == excludeId) continue
             const info = imageOverlayExt.get(oid)
             if (info == null) continue
-            if (info.layer.getId() == lid) return lid
+            if ((info.layer as Layer).getId() == lid) return lid
         }
     }
     return ''
@@ -2105,7 +2175,7 @@ function placeImageLayerByZIndex(style: Style, layer: RasterLayer, z: number | n
             if (layersAll != null) {
                 const all = Array.fromNative(layersAll)
                 for (let j = 0; j < all.length; j++) {
-                    const lid = (all[j] as any).getId() as string
+                    const lid = (all[j] as Layer).getId() as string
                     if (lid == 'tdt-bg') continue
                     style.addLayerBelow(layer, lid)
                     return
@@ -2149,7 +2219,7 @@ function attachImageOverlayToStyle(id: number, params: ImageOverlayOptions, styl
     layer.setProperties(PropertyFactory.rasterOpacity((1.0 - (params.transparency ?? 0)).toFloat()))
     const visible = params.visible ?? true
     if (!visible) {
-        layer.setVisible(false)
+        layer.setProperties(PropertyFactory.visibility(Property.NONE))
     }
     placeImageLayerByZIndex(style, layer, params.zIndex, id)
     imageOverlayExt.set(id, { source: source, layer: layer, params: params, bitmap: bitmap })
@@ -2168,9 +2238,10 @@ function attachImageOverlayToStyle(id: number, params: ImageOverlayOptions, styl
 // uts-for-android.md §2.4）。updateMode=true 时仅 setBitmap 换图不重建图层。
 // 竞态防护：回调时校验 entry 仍在 overlayMap（clear/destroy/remove 后丢弃）
 function decodeLocalBitmapForOverlay(id: number, params: ImageOverlayOptions, updateMode: boolean): void {
-    UTSAndroid.getDispatcher("io").async(function(_: any) {
+    // dispatcher.async 回调签名为 (Any?) -> Unit：参数须可空 any|null，且第二参数（同步回调）传 null（官方 utsandroid.md 示例）
+    UTSAndroid.getDispatcher("io").async(function(_: any | null) {
         const bmp = decodeSampledBitmapFromFile(params.image, IMAGE_OVERLAY_MAX_DIM)
-        UTSAndroid.getDispatcher("main").async(function(_: any) {
+        UTSAndroid.getDispatcher("main").async(function(_: any | null) {
             const entry = overlayMap.get(id)
             if (entry == null) {
                 if (bmp != null) (bmp as Bitmap).recycle()
@@ -2187,7 +2258,8 @@ function decodeLocalBitmapForOverlay(id: number, params: ImageOverlayOptions, up
             if (updateMode) {
                 const ext = imageOverlayExt.get(id)
                 if (ext != null && entry.nativeRef != null) {
-                    (entry.nativeRef.source as ImageSource).setBitmap(bmp as Bitmap)
+                    // maplibre 11.x ImageSource 无 setBitmap，换图 API 为 setImage(Bitmap)
+                    ((entry.nativeRef as ImageOverlayExt).source as ImageSource).setImage(bmp as Bitmap)
                     ext.bitmap = bmp
                 } else {
                     (bmp as Bitmap).recycle()
@@ -2201,11 +2273,15 @@ function decodeLocalBitmapForOverlay(id: number, params: ImageOverlayOptions, up
                 if (errCb2 != null) {
                     errCb2({ code: 4, message: "样式未加载，无法添加图片覆盖物" })
                 }
-                overlayMap.delete(id)
-                (bmp as Bitmap).recycle()
+                if (!updateMode) {
+                    overlayMap.delete(id)
+                }
+                if (bmp != null) {
+                    (bmp as Bitmap).recycle()
+                }
                 return
             }
-            attachImageOverlayToStyle(id, params, style, bmp)
+            attachImageOverlayToStyle(id, params, style!, bmp)
         }, null)
     }, null)
 }
@@ -2283,8 +2359,9 @@ export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOption
     if (changes.visible != null) p.visible = changes.visible
     if (changes.clickable != null) p.clickable = changes.clickable
     try {
-        const src = entry.nativeRef.source as ImageSource
-        const layer = entry.nativeRef.layer as RasterLayer
+        const nRef = entry.nativeRef as ImageOverlayExt
+        const src = nRef.source as ImageSource
+        const layer = nRef.layer as RasterLayer
         // 范围/旋转变化：setCoordinates 官方 API；换图：URL 直设或本机路径重新解码后 setBitmap
         if (changes.southwest != null || changes.northeast != null || changes.bearing != null || changes.image != null) {
             if (changes.image != null
@@ -2302,7 +2379,7 @@ export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOption
         }
         if (changes.visible != null) {
             const visible = p.visible != false
-            layer.setVisible(visible)
+            layer.setProperties(PropertyFactory.visibility(visible ? Property.VISIBLE : Property.NONE))
             entry.isVisible = visible
         }
         // zIndex 档位变化：Android Style 无 moveLayer，removeLayer 后按新档位重插（同一 layer 对象可复用）
@@ -2347,6 +2424,10 @@ export function setGeoJsonReplayCallback(callback: GeoJsonReplayCallback | null)
 // context7 验证：MapLibre RasterSource + RasterLayer 支持外部 XYZ 瓦片
 type CustomTileEntry = { source: any, layer: any, tileUrl: string, options: TileLayerOptions }
 let customTileSources = new Map<string, CustomTileEntry>()
+// 样式重建重放快照（any 元素上点访问会报"找不到名称"，用显式 type 承接）
+type SavedCustomTile = { id: string, entry: CustomTileEntry }
+// 图片覆盖物样式重建重放快照（同上，显式 type 承接）
+type SavedImageOverlay = { id: number, params: ImageOverlayOptions, bitmap: any | null, visible: boolean }
 // v1.8.0: 平行数组存 key 顺序（重建按添加顺序重放）
 let customTileLayerIds: Array<string> = []
 // v1.8.0: 聚合/热力数据快照 + 自定义样式激活标记
@@ -2453,7 +2534,7 @@ export function addWMSTileLayer(id: string, wmsUrl: string, layers: string, opti
 function rebuildUserLayersAfterStyle(): void {
     const ids = customTileLayerIds.slice()
     customTileLayerIds = []
-    const saved: Array<any> = []
+    const saved: Array<SavedCustomTile> = []
     for (let i = 0; i < ids.length; i++) {
         const e = customTileSources.get(ids[i])
         if (e != null) saved.push({ id: ids[i], entry: e })
@@ -2463,14 +2544,14 @@ function rebuildUserLayersAfterStyle(): void {
         addCustomTileLayer(saved[i].id, saved[i].entry.tileUrl, saved[i].entry.options)
     }
     if (clusterDataRef != null) {
-        const pts = clusterDataRef
+        const pts = clusterDataRef!
         const opts = clusterOptionsRef
         clusterDataRef = null
         clusterOptionsRef = null
         addMarkerCluster(pts, opts)
     }
     if (heatmapDataRef != null) {
-        const pts = heatmapDataRef
+        const pts = heatmapDataRef!
         const opts = heatmapOptionsRef
         heatmapDataRef = null
         heatmapOptionsRef = null
@@ -2478,7 +2559,7 @@ function rebuildUserLayersAfterStyle(): void {
     }
     // v1.9.0: 图片覆盖物重放（本机解码的复用持有位图不重新解码；URL 的交给 MapLibre 内部重新加载）
     if (imageOverlayIds.length > 0) {
-        const savedImgs: Array<any> = []
+        const savedImgs: Array<SavedImageOverlay> = []
         for (let i = 0; i < imageOverlayIds.length; i++) {
             const oid = imageOverlayIds[i]
             const ext = imageOverlayExt.get(oid)
@@ -2492,16 +2573,16 @@ function rebuildUserLayersAfterStyle(): void {
         const st2 = mapLibreMap?.getStyle()
         if (st2 != null) {
             for (let i = 0; i < savedImgs.length; i++) {
-                const oid = savedImgs[i].id as number
+                const oid = savedImgs[i].id
                 // 重建 entry（保持原 ID 与添加顺序；nativeRef 由 attach 回填）
                 overlayMap.set(oid, { id: oid, type: 'image', nativeRef: null, isVisible: true })
                 try {
-                    attachImageOverlayToStyle(oid, savedImgs[i].params as ImageOverlayOptions, st2, savedImgs[i].bitmap)
+                    attachImageOverlayToStyle(oid, savedImgs[i].params, st2, savedImgs[i].bitmap)
                     // 恢复重建前的可见性（hide 过的不能因重建而复现）
-                    const snapVisible = savedImgs[i].visible as boolean
+                    const snapVisible = savedImgs[i].visible
                     const entry2 = overlayMap.get(oid)
                     if (!snapVisible && entry2 != null && entry2.nativeRef != null) {
-                        (entry2.nativeRef.layer as RasterLayer).setVisible(false)
+                        ((entry2.nativeRef as ImageOverlayExt).layer as RasterLayer).setProperties(PropertyFactory.visibility(Property.NONE))
                         entry2.isVisible = false
                     }
                 } catch (e: any) {
@@ -2540,10 +2621,10 @@ export function setStyle(styleJson: string): void {
         })
     } catch (e: any) {
         customStyleActive = false
-        console.error("TDTMap: setStyle 解析失败: " + (e.message ?? String(e)))
+        console.error("TDTMap: setStyle 解析失败: " + e.message)
         const errCb2 = onErrorCallback
         if (errCb2 != null) {
-            errCb2({ code: 4, message: "setStyle 解析失败: " + (e.message ?? String(e)) })
+            errCb2({ code: 4, message: "setStyle 解析失败: " + e.message })
         }
     }
 }

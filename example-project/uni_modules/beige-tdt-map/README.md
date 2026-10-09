@@ -514,6 +514,14 @@ type ImageOverlayClickDetail = { id: number; lat: number; lng: number }
 
 ## 版本历史
 
+### v1.9.2（2026-10）
+
+#### ⚡ 性能：GeoJSON 图层描边批量建层（addStyledPolylineBatch）
+
+- 整层全部环一次调用建一个渲染层（百环级行政边界：N 次 source+layer → 1 次，UI 阻塞秒级→毫秒级）
+- Android=单 GeoJsonSource(MultiLineString)+单 LineLayer；iOS=MLNMultiPolyline+单 MLNLineStyleLayer；Web=单 MultiLineString source；鸿蒙 MapKit 无多段线，原语内部逐线 addPolyline（省 N 次桥接，type='styledPolylineBatch' 独立管理分支）
+- 单线 addStyledPolyline 保留不动；addGeoJsonLayer 编排自动走批量路径，组件 API 零变化
+
 ### v1.9.0（2026-09）
 
 #### ✨ 新增：图片覆盖物（ImageOverlay）
@@ -928,7 +936,11 @@ echo file_get_contents($url);
 
 ## 更新日志
 
-### v1.9.0 🖼️（最新）
+### v1.9.2 ⚡（最新）
+
+- ⚡ 性能：新增 `addStyledPolylineBatch`——批量 styled 折线一次建层；`addGeoJsonLayer` 描边编排自动批量化（122 环边界图层实测建层秒级→毫秒级）
+
+### v1.9.0 🖼️
 
 - ✨ 新增：图片覆盖物 `addImageOverlay` / `updateImageOverlay` / `@imageOverlayClick`——图片按地理范围拉伸贴合，支持 transparency/zIndex 三档/bearing 旋转/visible/clickable，复用 overlay ID 统一管理体系
 - 🌐 四端统一：Android（ImageSource URL 直载 / 本机路径 io 线程两段解码防 OOM）、iOS（MLNImageSource 引擎直载 / 本机 UIImage）、鸿蒙（华为原生 addImageOverlay 全参数 + http 下载转 PixelMap + >4096 下采样）、Web（image source + raster layer）

@@ -133,6 +133,8 @@ import {
   setGeoJsonReplayCallback as nativeSetGeoJsonReplayCallback,
   // v1.9.0: E0.3a styled 折线（虚线/透明度）
   addStyledPolyline as nativeAddStyledPolyline,
+  // v1.9.2: 批量 styled 折线（GeoJSON 层编排专用，百环级图层单层渲染）
+  addStyledPolylineBatch as nativeAddStyledPolylineBatch,
   // v1.9.0: E0.3b styled 文本（CJK 基线=文字转位图）
   addStyledText as nativeAddStyledText
 } from '@/uni_modules/beige-tdt-map'
@@ -467,6 +469,22 @@ function drawStyledPolyline(points: Array<GeoLatLng>, color: string, width: numb
   return nativeAddStyledPolyline(detail, color, width, dash, opacity)
 }
 
+// v1.9.2: 批量 styled 折线——整层描边一次建层（GeoJSON 层编排专用）。
+// 入参扁平化（points 串联 + ringLengths 环长）：规避嵌套类型数组跨端桥接丢内层类型
+// （Array<Array<MapClickDetail>> Android 实测内层变 UTSJSONObject）；点数 <2 的环跳过
+function drawStyledPolylineBatch(rings: Array<Array<GeoLatLng>>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+  const flat: Array<MapClickDetail> = []
+  const ringLengths: Array<number> = []
+  for (let i = 0; i < rings.length; i++) {
+    if (rings[i].length < 2) continue
+    ringLengths.push(rings[i].length)
+    for (let j = 0; j < rings[i].length; j++) {
+      flat.push({ lat: rings[i][j].latitude, lng: rings[i][j].longitude })
+    }
+  }
+  return nativeAddStyledPolylineBatch(flat, ringLengths, color, width, dash, opacity)
+}
+
 // v1.9.0: E0.3b styled 文本（CJK 基线=文字转位图，经图像叠加通路锚定 lat/lng）
 function drawStyledText(lat: number, lng: number, text: string, options: StyledTextOptions): number { return nativeAddStyledText(lat, lng, text, options) }
 function drawCircle(lat: number, lng: number, radius: number, color: string, fillColor: string): number { return addCircle(lat, lng, radius, color, fillColor) }
@@ -641,8 +659,9 @@ let geoJsonLayerSources = new Map<number, string>()                  // 层 ID �
 let geoJsonLayerOptionsMap = new Map<number, GeoJsonLayerOptions>()  // 层 ID → options 快照（重放依据）
 let geoJsonLayerVisible = new Map<number, boolean>()                 // 层 ID → 可见性（重放后恢复隐藏态）
 
-// 内部编排：解析产物 → 逐 feature 逐 ring 调 draw 原语。
-// 描边走 drawStyledPolyline（E0.3a：lineDash=null 实线 / 虚线如 [4,4]，opacity=1 对齐 chatbot）；
+// 内部编排：解析产物 → 描边批量建一层 + 填充/标注逐要素。
+// 描边走 drawStyledPolylineBatch（v1.9.2：整层全部环一次 MultiLineString 建层——百环级图层
+// 从 N 次 source+layer 建立降为 1 次，UI 阻塞秒级→毫秒级；v1.9.0 的逐环 drawStyledPolyline 保留为单线原语）；
 // 填充仅作用外环（fill 自带 outline 传 fillColor 隐形化，描边统一由描边原语负责、线宽可控）；
 // 标注走 drawStyledText（E0.3b：label.field 文本 + positionField 锚点，二者缺失跳过不抛异常）
 function buildGeoJsonOverlays(features: Array<GeoParsedFeature>, options: GeoJsonLayerOptions): Array<number> {
@@ -658,11 +677,7 @@ function buildGeoJsonOverlays(features: Array<GeoParsedFeature>, options: GeoJso
       const fillId = drawPolygon(f.rings[0], fillColor, fillColor)
       if (fillId > 0) ids.push(fillId)
     }
-    for (let j = 0; j < f.rings.length; j++) {
-      ringCount++
-      const strokeId = drawStyledPolyline(f.rings[j], options.lineColor, options.lineWidth, options.lineDash, 1.0)
-      if (strokeId > 0) ids.push(strokeId)
-    }
+    ringCount += f.rings.length
     // 标注分支（E0.3b 接线）：文本缺失跳过；锚点缺失已由解析器回退外环质心
     const fLabel = f.label
     const fAnchorLat = f.anchorLat
@@ -680,6 +695,18 @@ function buildGeoJsonOverlays(features: Array<GeoParsedFeature>, options: GeoJso
         labelCount++
       }
     }
+  }
+  // 整层描边一次建层（fill 无关；环数>0 才调，空批交原语返回 0 无害但省一次桥接）
+  if (ringCount > 0) {
+    const allRings: Array<Array<GeoLatLng>> = []
+    for (let i = 0; i < features.length; i++) {
+      const rings = features[i].rings
+      for (let j = 0; j < rings.length; j++) {
+        allRings.push(rings[j])
+      }
+    }
+    const strokeId = drawStyledPolylineBatch(allRings, options.lineColor, options.lineWidth, options.lineDash, 1.0)
+    if (strokeId > 0) ids.push(strokeId)
   }
   console.log('TDTMap: GeoJSON 编排完成 feature=' + features.length + ' ring=' + ringCount + ' label=' + labelCount + ' 子覆盖物=' + ids.length)
   return ids

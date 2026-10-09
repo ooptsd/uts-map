@@ -1,5 +1,11 @@
 # beige-tdt-map 更新日志
 
+## 1.9.2（2026-10-09）
+
+- ⚡ 性能：新增 `addStyledPolylineBatch`——批量 styled 折线一次调用建一个渲染层；`addGeoJsonLayer` 描边编排自动批量化（BeaconApp 雷达页 122 环两层建层 7.7s → 3.9s，描边部分毫秒级）
+- 🌐 四端：Android=GeoJSON 字符串直构 MultiLineString 单 source+单 LineLayer（绕开嵌套泛型桥接）；iOS=MLNMultiPolyline 单 source+单 layer；Web=单 MultiLineString source；鸿蒙 MapKit 无多段线→内部逐线 addPolyline 省 N 次桥接（type='styledPolylineBatch' 独立 remove/show/hide 分支）
+- 🔧 入参扁平化（points 串联 + ringLengths 环长）规避嵌套类型数组跨端桥接丢内层类型；单线 `addStyledPolyline` 保留不动；组件 API 零变化
+
 ## 1.9.0（发布时填写日期）
 
 - ✨ 新增：图片覆盖物 `addImageOverlay` / `updateImageOverlay` / `setImageOverlayClickCallback`（组件层 `@imageOverlayClick`）——图片按地理范围拉伸贴合，支持 transparency/zIndex 三档/bearing 旋转/visible/clickable，复用 overlay ID 统一管理体系（removeOverlay/showOverlay/hideOverlay/clearOverlays）

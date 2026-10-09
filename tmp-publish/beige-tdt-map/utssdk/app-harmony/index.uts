@@ -1,5 +1,5 @@
 import { map, mapCommon } from '@kit.MapKit'
-import { AsyncCallback } from '@kit.BasicServicesKit'
+import { AsyncCallback, BusinessError } from '@kit.BasicServicesKit'
 import { BuilderNode } from '@kit.ArkUI'
 import { http } from '@kit.NetworkKit'
 import { geoLocationManager } from '@kit.LocationKit'
@@ -38,12 +38,12 @@ let currentBearing: number = 0
 let currentTilt: number = 0
 
 // Polygon storage
-let polygons: Array<any> = []
-let polylines: Array<any> = []
-let circles: Array<any> = []
-let rectangles: Array<any> = []
+let polygons: Array<map.MapPolygon> = []
+let polylines: Array<map.MapPolyline> = []
+let circles: Array<map.MapCircle> = []
+let rectangles: Array<map.MapPolygon> = []
 // Marker tracking（Android/iOS 模式：逐个管理，避免 mapController.clear() 连带清除非标记覆盖物）
-let markerList: Array<any> = []
+let markerList: Array<map.Marker> = []
 
 // ── 覆盖物 ID 追踪系统 ──
 // 为每个添加的覆盖物分配唯一 ID，支持 removeOverlay/showOverlay/hideOverlay 单个操作
@@ -53,7 +53,7 @@ let overlayMap = new Map<number, OverlayEntry>()
 type OverlayEntry = {
     id: number
     type: string  // 'marker' | 'polygon' | 'polyline' | 'circle' | 'rectangle' | 'label' | 'image'
-    nativeRef: any  // 鸿蒙原生覆盖物对象
+    nativeRef: map.BaseOverlay | null  // 鸿蒙原生覆盖物（Marker/MapPolygon/MapPolyline/MapCircle/ImageOverlay/TileOverlay 均继承 BaseOverlay）
     isVisible: boolean
 }
 
@@ -62,8 +62,8 @@ type OverlayEntry = {
 // 本机缓存路径直接 createImageSource(path)；PixelMap 由插件持有并在移除/清理时 release
 type ImageOverlayExt = {
     params: ImageOverlayOptions
-    pixelMap: any | null
-    pendingUpdate: any | null   // 图片加载期间收到的更新累积器（any：空对象字面量不能 as 断言到全可选类型）
+    pixelMap: image.PixelMap | null
+    pendingUpdate: ImageOverlayUpdateOptions | null   // 图片加载期间收到的更新累积器（挂载完成后统一重放）
 }
 let imageOverlayExt = new Map<number, ImageOverlayExt>()
 let imageOverlayIds: Array<number> = []
@@ -81,7 +81,8 @@ let cameraChangeCallback: CameraChangeCallback | null = null
 function allocateOverlayId(type: string, nativeRef: any): number {
     overlayIdCounter++
     const id = overlayIdCounter
-    overlayMap.set(id, { id: id, type: type, nativeRef: nativeRef, isVisible: true })
+    const entry: OverlayEntry = { id: id, type: type, nativeRef: nativeRef, isVisible: true }
+    overlayMap.set(id, entry)
     return id
 }
 
@@ -125,25 +126,30 @@ function clearOverlayType(type: string): void {
 // 鸿蒙 MapKit 官方约束：tileUrl 必须以 http/https 开头且包含 {x}、{y}、{z} 占位符。
 // 注意：MapKit TileOverlay 单图层只允许一个 URL，且最多 10 个图层，无法像 Android/iOS 那样并行多子域名加载。
 // 鸿蒙端性能依赖 MapKit 自身 HTTP 连接池，实测通常够用。
-const TDT_TILE_URLS: Record<string, string> = {
-    vec: 'https://t0.tianditu.gov.cn/DataServer?T=vec_w&x={x}&y={y}&l={z}&tk=',
-    cva: 'https://t0.tianditu.gov.cn/DataServer?T=cva_w&x={x}&y={y}&l={z}&tk=',
-    img: 'https://t0.tianditu.gov.cn/DataServer?T=img_w&x={x}&y={y}&l={z}&tk=',
-    cia: 'https://t0.tianditu.gov.cn/DataServer?T=cia_w&x={x}&y={y}&l={z}&tk=',
-    ter: 'https://t0.tianditu.gov.cn/DataServer?T=ter_w&x={x}&y={y}&l={z}&tk=',
-    cta: 'https://t0.tianditu.gov.cn/DataServer?T=cta_w&x={x}&y={y}&l={z}&tk='
-}
+// ArkTS 禁止 Record 类型标注的对象字面量初始化，改用 Map + 显式 set
+const TDT_TILE_URLS = new Map<string, string>()
+TDT_TILE_URLS.set('vec', 'https://t0.tianditu.gov.cn/DataServer?T=vec_w&x={x}&y={y}&l={z}&tk=')
+TDT_TILE_URLS.set('cva', 'https://t0.tianditu.gov.cn/DataServer?T=cva_w&x={x}&y={y}&l={z}&tk=')
+TDT_TILE_URLS.set('img', 'https://t0.tianditu.gov.cn/DataServer?T=img_w&x={x}&y={y}&l={z}&tk=')
+TDT_TILE_URLS.set('cia', 'https://t0.tianditu.gov.cn/DataServer?T=cia_w&x={x}&y={y}&l={z}&tk=')
+TDT_TILE_URLS.set('ter', 'https://t0.tianditu.gov.cn/DataServer?T=ter_w&x={x}&y={y}&l={z}&tk=')
+TDT_TILE_URLS.set('cta', 'https://t0.tianditu.gov.cn/DataServer?T=cta_w&x={x}&y={y}&l={z}&tk=')
 
-// 地图类型与图层映射
-const TYPE_LAYER_MAP: Record<string, { base: string, label: string }> = {
-    vec: { base: 'vec', label: 'cva' },
-    img: { base: 'img', label: 'cia' },
-    ter: { base: 'ter', label: 'cta' }
+// 地图类型与图层映射（对象字面量需经工厂函数以显式类型承接，规避 as 断言）
+type TileLayerIds = { base: string, label: string }
+function makeTileLayerIds(base: string, label: string): TileLayerIds {
+    const ids: TileLayerIds = { base: base, label: label }
+    return ids
 }
+const TYPE_LAYER_MAP = new Map<string, TileLayerIds>()
+TYPE_LAYER_MAP.set('vec', makeTileLayerIds('vec', 'cva'))
+TYPE_LAYER_MAP.set('img', makeTileLayerIds('img', 'cia'))
+TYPE_LAYER_MAP.set('ter', makeTileLayerIds('ter', 'cta'))
 
 // 预创建的所有瓦片图层 [vec:0, img:1, ter:2]
 // 存储所有图层引用以便切换时直接 toggle，无需移除重建
-let allTileOverlays: Array<{ base: map.TileOverlay | null, label: map.TileOverlay | null }> = [
+type TileOverlayPair = { base: map.TileOverlay | null, label: map.TileOverlay | null }
+let allTileOverlays: Array<TileOverlayPair> = [
     { base: null, label: null },
     { base: null, label: null },
     { base: null, label: null }
@@ -173,8 +179,8 @@ function parseColorHex(hexColor: string): number {
 
 // context7 验证：addTileOverlay 返回 TileOverlay（同步），与 addMarker/addPolygon（返回 Promise）不同。
 // await 对同步返回值安全透传，此处使用 await 仅为与代码风格保持一致。
-async function createTileLayerPair(mapType: string, apiKey: string): Promise<{ base: map.TileOverlay | null, label: map.TileOverlay | null }> {
-    const layers = TYPE_LAYER_MAP[mapType]
+async function createTileLayerPair(mapType: string, apiKey: string): Promise<TileOverlayPair> {
+    const layers = TYPE_LAYER_MAP.get(mapType)
     if (layers == null) {
         return { base: null, label: null }
     }
@@ -182,14 +188,14 @@ async function createTileLayerPair(mapType: string, apiKey: string): Promise<{ b
     // TileOverlayParams 自 5.0.3(15) 支持；TileOverlayOptions 及 diskCacheEnabled/diskCacheSize
     // 磁盘缓存参数需 6.0.0(20)+，为兼容低版本此处不使用
     let baseOptions: mapCommon.TileOverlayParams = {
-        tileUrl: TDT_TILE_URLS[layers.base] + apiKey,
+        tileUrl: (TDT_TILE_URLS.get(layers.base) ?? '') + apiKey,
         transparency: 0,
         fadeIn: true
     }
     let baseOverlay = await mapController?.addTileOverlay(baseOptions) ?? null
 
     let labelOptions: mapCommon.TileOverlayParams = {
-        tileUrl: TDT_TILE_URLS[layers.label] + apiKey,
+        tileUrl: (TDT_TILE_URLS.get(layers.label) ?? '') + apiKey,
         transparency: 0,
         fadeIn: true
     }
@@ -214,10 +220,10 @@ async function preCreateAllTileLayers(apiKey: string, activeType: string): Promi
                 pair.label?.remove()
                 allTileOverlays[i] = { base: null, label: null }
             }
-        } catch (e: any) {
-            console.error("TDTMap: Failed to pre-create tile layer for " + type, e.message ?? e)
+        } catch (e) {
+            console.error("TDTMap: Failed to pre-create tile layer for " + type, (e as Error).message ?? e)
             if (onErrorCallback != null) {
-                onErrorCallback({ code: 3, message: 'Tile layer pre-creation failed for ' + type + ': ' + (e.message ?? String(e)) })
+                onErrorCallback({ code: 3, message: 'Tile layer pre-creation failed for ' + type + ': ' + ((e as Error).message ?? String(e)) })
             }
         }
     }
@@ -241,7 +247,7 @@ export function initMap(
     console.log("TDTMap: initMap key=" + (options.apiKey.length > 0 ? "***" : "空") + " type=" + options.mapType)
 
     // 诊断日志：输出瓦片 URL（复制到浏览器验证 key 是否有效）
-    const diagUrl = TDT_TILE_URLS['vec'] + options.apiKey
+    const diagUrl = (TDT_TILE_URLS.get('vec') ?? '') + options.apiKey
     console.log("TDTMap: 诊断URL(浏览器验证)= " + diagUrl.replace("{x}", "537").replace("{y}", "389").replace("{z}", "10"))
 
     // 记录初始相机状态
@@ -293,8 +299,8 @@ export function initMap(
         try {
             controller.setLogoAlignment(mapCommon.LogoAlignment.BOTTOM_END)
             controller.setApproveNumberEnabled(false)
-        } catch (e: any) {
-            console.warn("TDTMap: 控件配置失败（低版本 MapKit 不支持）", e.message ?? String(e))
+        } catch (e) {
+            console.warn("TDTMap: 控件配置失败（低版本 MapKit 不支持）", (e as Error).message ?? String(e))
         }
 
         // 预创建所有 3 类瓦片图层对（异步，addTileOverlay 返回 Promise）
@@ -313,7 +319,7 @@ export function initMap(
             })
 
             // 标记点击事件 — HarmonyOS MapKit markerClick 事件
-            evtMgr.on('markerClick', (marker: any) => {
+            evtMgr.on('markerClick', (marker: map.Marker) => {
                 const cb = markerClickCallback
                 if (cb != null) {
                     const position = marker.getPosition()
@@ -325,7 +331,7 @@ export function initMap(
 
             // v1.9.0: 图片覆盖物点击 — 华为 MapKit imageOverlayClick 事件（官方文档验证）
             // 回调参数为 map.ImageOverlay，getId() 反查插件 overlay ID；坐标取 bounds 中心（华为不提供点击点）
-            evtMgr.on('imageOverlayClick', (overlay: any) => {
+            evtMgr.on('imageOverlayClick', (overlay: map.ImageOverlay) => {
                 const imgCb = imageOverlayClickCallback
                 if (imgCb != null && overlay != null) {
                     let pluginId = 0
@@ -407,15 +413,15 @@ export function switchMapType(mapType: string): void {
     allTileOverlays[oldIndex] = { base: null, label: null }
 
     // 重建目标类型图层（fire-and-forget）
-    const layers = TYPE_LAYER_MAP[effectiveType]
+    const layers = TYPE_LAYER_MAP.get(effectiveType)
     if (layers == null) return
     addTiandituTileLayer(effectiveType, currentApiKey).then(() => {
         const newIndex = getTypeIndex(effectiveType)
         allTileOverlays[newIndex] = { base: tileOverlay, label: labelOverlay }
-    }).catch((e: any) => {
-        console.error("TDTMap: switchMapType 瓦片切换失败: " + (e.message ?? String(e)))
+    }).catch((e: Error) => {
+        console.error("TDTMap: switchMapType 瓦片切换失败: " + ((e as Error).message ?? String(e)))
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 3, message: 'Tile layer switch failed for ' + effectiveType + ': ' + (e.message ?? String(e)) })
+            onErrorCallback({ code: 3, message: 'Tile layer switch failed for ' + effectiveType + ': ' + ((e as Error).message ?? String(e)) })
         }
     })
 }
@@ -425,10 +431,10 @@ async function addTiandituTileLayer(mapType: string, apiKey: string): Promise<vo
         const pair = await createTileLayerPair(mapType, apiKey)
         tileOverlay = pair.base
         labelOverlay = pair.label
-    } catch (e: any) {
-        console.error("TDTMap: Failed to add tile layer", e.message ?? e)
+    } catch (e) {
+        console.error("TDTMap: Failed to add tile layer", (e as Error).message ?? e)
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 3, message: 'Tile layer loading failed: ' + (e.message ?? String(e)) })
+            onErrorCallback({ code: 3, message: 'Tile layer loading failed: ' + ((e as Error).message ?? String(e)) })
         }
     }
 }
@@ -438,12 +444,13 @@ export function setCenter(lat: number, lng: number): void {
         currentLat = lat
         currentLng = lng
         // context7 验证：CameraPosition 必须包含 zoom 避免字段缺失时 reset 为默认值
-        mapController.setCameraPosition({
+        const cameraPos: mapCommon.CameraPosition = {
             target: { latitude: lat, longitude: lng },
             zoom: currentZoom,
             bearing: currentBearing,
             tilt: currentTilt
-        })
+        }
+        mapController.moveCamera(map.newCameraPosition(cameraPos))
     }
 }
 
@@ -451,12 +458,13 @@ export function setZoom(zoom: number): void {
     if (mapController != null) {
         currentZoom = zoom
         // context7 验证：CameraPosition 必须包含 target 避免字段缺失时重置为 (0,0)
-        mapController.setCameraPosition({
+        const cameraPos: mapCommon.CameraPosition = {
             target: { latitude: currentLat, longitude: currentLng },
             zoom: zoom,
             bearing: currentBearing,
             tilt: currentTilt
-        })
+        }
+        mapController.moveCamera(map.newCameraPosition(cameraPos))
     }
 }
 
@@ -484,12 +492,13 @@ export function fitBounds(minLat: number, minLng: number, maxLat: number, maxLng
     if (zoom > 20) zoom = 20
     zoom = Math.floor(zoom)
 
-    mapController.setCameraPosition({
+    const fitPos: mapCommon.CameraPosition = {
         target: { latitude: centerLat, longitude: centerLng },
         zoom: zoom,
         bearing: currentBearing,
         tilt: currentTilt
-    })
+    }
+    mapController.moveCamera(map.newCameraPosition(fitPos))
 
     currentLat = centerLat
     currentLng = centerLng
@@ -501,9 +510,10 @@ export function addMarker(lat: number, lng: number, title: string, snippet?: str
         // 预分配 ID（同步），异步完成后更新 nativeRef
         overlayIdCounter++
         const id = overlayIdCounter
-        overlayMap.set(id, { id: id, type: 'marker', nativeRef: null, isVisible: true })
+        const entry: OverlayEntry = { id: id, type: 'marker', nativeRef: null, isVisible: true }
+        overlayMap.set(id, entry)
         // context7 验证：addMarker 返回 Promise 且可能 reject（错误码 401/1002601001），需要错误处理
-        const markerOpts: any = {
+        const markerOpts: mapCommon.MarkerOptions = {
             position: { latitude: lat, longitude: lng },
             title: title
         }
@@ -511,15 +521,15 @@ export function addMarker(lat: number, lng: number, title: string, snippet?: str
         if (snippet != null && snippet.length > 0) {
             markerOpts.snippet = snippet
         }
-        mapController.addMarker(markerOpts).then((marker: any) => {
+        mapController.addMarker(markerOpts).then((marker: map.Marker) => {
             markerList.push(marker)
             // 更新 nativeRef
             const entry = overlayMap.get(id)
             if (entry != null) {
                 entry.nativeRef = marker
             }
-        }).catch((e: any) => {
-            console.error("TDTMap: addMarker 失败: " + (e.message ?? String(e)))
+        }).catch((e: Error) => {
+            console.error("TDTMap: addMarker 失败: " + ((e as Error).message ?? String(e)))
             overlayMap.delete(id)
         })
         return id
@@ -552,18 +562,21 @@ export function addPolygon(points: Array<MapClickDetail>, color: string, fillCol
     // 预分配 ID（同步），异步完成后更新 nativeRef
     overlayIdCounter++
     const id = overlayIdCounter
-    overlayMap.set(id, { id: id, type: 'polygon', nativeRef: null, isVisible: true })
+    const entry: OverlayEntry = { id: id, type: 'polygon', nativeRef: null, isVisible: true }
+    overlayMap.set(id, entry)
     const latLngs: Array<mapCommon.LatLng> = []
     for (let i = 0; i < points.length; i++) {
-        latLngs.push({ latitude: points[i].lat, longitude: points[i].lng })
+        const ll: mapCommon.LatLng = { latitude: points[i].lat, longitude: points[i].lng }
+        latLngs.push(ll)
     }
     const strokeColorNum = parseColorHex(color)
     const fillColorNum = parseColorHex(fillColor)
-    mapController.addPolygon({
+    const polygonOpts: mapCommon.MapPolygonOptions = {
         points: latLngs,
         strokeColor: strokeColorNum,
         fillColor: fillColorNum
-    }).then((polygon: any) => {
+    }
+    mapController.addPolygon(polygonOpts).then((polygon: map.MapPolygon) => {
         if (polygon != null) {
             polygons.push(polygon)
             const entry = overlayMap.get(id)
@@ -571,11 +584,11 @@ export function addPolygon(points: Array<MapClickDetail>, color: string, fillCol
                 entry.nativeRef = polygon
             }
         }
-    }).catch((e: any) => {
-        console.error("TDTMap: 添加多边形失败: " + (e.message ?? String(e)))
+    }).catch((e: Error) => {
+        console.error("TDTMap: 添加多边形失败: " + ((e as Error).message ?? String(e)))
         overlayMap.delete(id)
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 4, message: "添加多边形失败: " + (e.message ?? String(e)) })
+            onErrorCallback({ code: 4, message: "添加多边形失败: " + ((e as Error).message ?? String(e)) })
         }
     })
     return id
@@ -602,18 +615,21 @@ export function addPolyline(points: Array<MapClickDetail>, color: string, width:
     // 预分配 ID（同步）
     overlayIdCounter++
     const id = overlayIdCounter
-    overlayMap.set(id, { id: id, type: 'polyline', nativeRef: null, isVisible: true })
+    const entry: OverlayEntry = { id: id, type: 'polyline', nativeRef: null, isVisible: true }
+    overlayMap.set(id, entry)
     const latLngs: Array<mapCommon.LatLng> = []
     for (let i = 0; i < points.length; i++) {
-        latLngs.push({ latitude: points[i].lat, longitude: points[i].lng })
+        const ll: mapCommon.LatLng = { latitude: points[i].lat, longitude: points[i].lng }
+        latLngs.push(ll)
     }
     const colorNum = parseColorHex(color)
-    mapController.addPolyline({
+    const polylineOpts: mapCommon.MapPolylineOptions = {
         points: latLngs,
         color: colorNum,
         width: width,
         visible: true
-    }).then((polyline: any) => {
+    }
+    mapController.addPolyline(polylineOpts).then((polyline: map.MapPolyline) => {
         if (polyline != null) {
             polylines.push(polyline)
             const entry = overlayMap.get(id)
@@ -621,11 +637,11 @@ export function addPolyline(points: Array<MapClickDetail>, color: string, width:
                 entry.nativeRef = polyline
             }
         }
-    }).catch((e: any) => {
-        console.error("TDTMap: 添加折线失败: " + (e.message ?? String(e)))
+    }).catch((e: Error) => {
+        console.error("TDTMap: 添加折线失败: " + ((e as Error).message ?? String(e)))
         overlayMap.delete(id)
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 4, message: "添加折线失败: " + (e.message ?? String(e)) })
+            onErrorCallback({ code: 4, message: "添加折线失败: " + ((e as Error).message ?? String(e)) })
         }
     })
     return id
@@ -657,18 +673,21 @@ export function addStyledPolyline(points: Array<MapClickDetail>, color: string, 
     // 预分配 ID（同步）
     overlayIdCounter++
     const id = overlayIdCounter
-    overlayMap.set(id, { id: id, type: 'styledPolyline', nativeRef: null, isVisible: true })
+    const entry: OverlayEntry = { id: id, type: 'styledPolyline', nativeRef: null, isVisible: true }
+    overlayMap.set(id, entry)
     const latLngs: Array<mapCommon.LatLng> = []
     for (let i = 0; i < points.length; i++) {
-        latLngs.push({ latitude: points[i].lat, longitude: points[i].lng })
+        const ll: mapCommon.LatLng = { latitude: points[i].lat, longitude: points[i].lng }
+        latLngs.push(ll)
     }
     const colorNum = applyOpacityToColor(parseColorHex(color), opacity ?? 1)
-    mapController.addPolyline({
+    const polylineOpts: mapCommon.MapPolylineOptions = {
         points: latLngs,
         color: colorNum,
         width: width,
         visible: true
-    }).then((polyline: any) => {
+    }
+    mapController.addPolyline(polylineOpts).then((polyline: map.MapPolyline) => {
         if (polyline != null) {
             polylines.push(polyline)
             const entry = overlayMap.get(id)
@@ -676,13 +695,66 @@ export function addStyledPolyline(points: Array<MapClickDetail>, color: string, 
                 entry.nativeRef = polyline
             }
         }
-    }).catch((e: any) => {
-        console.error("TDTMap: 添加 styled 折线失败: " + (e.message ?? String(e)))
+    }).catch((e: Error) => {
+        console.error("TDTMap: 添加 styled 折线失败: " + ((e as Error).message ?? String(e)))
         overlayMap.delete(id)
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 4, message: "添加 styled 折线失败: " + (e.message ?? String(e)) })
+            onErrorCallback({ code: 4, message: "添加 styled 折线失败: " + ((e as Error).message ?? String(e)) })
         }
     })
+    return id
+}
+
+// v1.9.2: 批量 styled 折线——鸿蒙 MapKit 无多段线几何，原语内部逐线 addPolyline
+// （省 N 次跨端桥接与 ID 分配；样式参数与单线版一致，dash 仍降级实线）。
+// 单个 overlay ID 管整批：type='styledPolylineBatch'，nativeRef=线数组（remove/show/hide 有独立分支）；
+// 各线同时入全局 polylines 数组（clearOverlays 横扫兜底，逐条 remove 后再过滤）
+export function addStyledPolylineBatch(points: Array<MapClickDetail>, ringLengths: Array<number>, color: string, width: number, dash: Array<number> | null, opacity?: number): number {
+    if (mapController == null || points.length == 0 || ringLengths.length == 0) return 0
+    if (dash != null && dash.length > 0 && !styledDashWarned) {
+        styledDashWarned = true
+        console.warn("TDTMap: 鸿蒙 MapKit 折线不支持虚线（MapPolylineOptions 无 dash 参数），已降级实线")
+    }
+    overlayIdCounter++
+    const id = overlayIdCounter
+    const refs: Array<map.MapPolyline> = []
+    const entry: OverlayEntry = { id: id, type: 'styledPolylineBatch', nativeRef: refs as any | null, isVisible: true }
+    overlayMap.set(id, entry)
+    const colorNum = applyOpacityToColor(parseColorHex(color), opacity ?? 1)
+    let added = 0
+    let offset = 0
+    for (let i = 0; i < ringLengths.length; i++) {
+        const len = ringLengths[i].toInt()
+        if (len < 2 || offset + len > points.length) {
+            offset += len
+            continue
+        }
+        const latLngs: Array<mapCommon.LatLng> = []
+        for (let j = 0; j < len; j++) {
+            const ll: mapCommon.LatLng = { latitude: points[offset + j].lat, longitude: points[offset + j].lng }
+            latLngs.push(ll)
+        }
+        const polylineOpts: mapCommon.MapPolylineOptions = {
+            points: latLngs,
+            color: colorNum,
+            width: width,
+            visible: true
+        }
+        added++
+        mapController.addPolyline(polylineOpts).then((polyline: map.MapPolyline) => {
+            if (polyline != null) {
+                refs.push(polyline)
+                polylines.push(polyline)
+            }
+        }).catch((e: Error) => {
+            console.error("TDTMap: 批量 styled 折线单线失败: " + ((e as Error).message ?? String(e)))
+        })
+        offset += len
+    }
+    if (added == 0) {
+        overlayMap.delete(id)
+        return 0
+    }
     return id
 }
 
@@ -718,17 +790,19 @@ export function addCircle(lat: number, lng: number, radius: number, color: strin
     // 预分配 ID（同步）
     overlayIdCounter++
     const id = overlayIdCounter
-    overlayMap.set(id, { id: id, type: 'circle', nativeRef: null, isVisible: true })
+    const entry: OverlayEntry = { id: id, type: 'circle', nativeRef: null, isVisible: true }
+    overlayMap.set(id, entry)
     const strokeColorNum = parseColorHex(color)
     const fillColorNum = parseColorHex(fillColor)
-    mapController.addCircle({
+    const circleOpts: mapCommon.MapCircleOptions = {
         center: { latitude: lat, longitude: lng },
         radius: radius,
         strokeColor: strokeColorNum,
         fillColor: fillColorNum,
         strokeWidth: 2,
         visible: true
-    }).then((circle: any) => {
+    }
+    mapController.addCircle(circleOpts).then((circle: map.MapCircle) => {
         if (circle != null) {
             circles.push(circle)
             const entry = overlayMap.get(id)
@@ -736,11 +810,11 @@ export function addCircle(lat: number, lng: number, radius: number, color: strin
                 entry.nativeRef = circle
             }
         }
-    }).catch((e: any) => {
-        console.error("TDTMap: 添加圆失败: " + (e.message ?? String(e)))
+    }).catch((e: Error) => {
+        console.error("TDTMap: 添加圆失败: " + ((e as Error).message ?? String(e)))
         overlayMap.delete(id)
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 4, message: "添加圆失败: " + (e.message ?? String(e)) })
+            onErrorCallback({ code: 4, message: "添加圆失败: " + ((e as Error).message ?? String(e)) })
         }
     })
     return id
@@ -754,7 +828,8 @@ export function addRectangle(minLat: number, minLng: number, maxLat: number, max
     // 预分配 ID（同步），异步完成后更新 nativeRef
     overlayIdCounter++
     const id = overlayIdCounter
-    overlayMap.set(id, { id: id, type: 'rectangle', nativeRef: null, isVisible: true })
+    const entry: OverlayEntry = { id: id, type: 'rectangle', nativeRef: null, isVisible: true }
+    overlayMap.set(id, entry)
     const latLngs: Array<mapCommon.LatLng> = [
         { latitude: minLat, longitude: minLng },
         { latitude: maxLat, longitude: minLng },
@@ -763,11 +838,12 @@ export function addRectangle(minLat: number, minLng: number, maxLat: number, max
     ]
     const strokeColorNum = parseColorHex(color)
     const fillColorNum = parseColorHex(fillColor)
-    mapController.addPolygon({
+    const polygonOpts: mapCommon.MapPolygonOptions = {
         points: latLngs,
         strokeColor: strokeColorNum,
         fillColor: fillColorNum
-    }).then((polygon: any) => {
+    }
+    mapController.addPolygon(polygonOpts).then((polygon: map.MapPolygon) => {
         if (polygon != null) {
             rectangles.push(polygon)
             const entry = overlayMap.get(id)
@@ -775,11 +851,11 @@ export function addRectangle(minLat: number, minLng: number, maxLat: number, max
                 entry.nativeRef = polygon
             }
         }
-    }).catch((e: any) => {
-        console.error("TDTMap: 添加矩形失败: " + (e.message ?? String(e)))
+    }).catch((e: Error) => {
+        console.error("TDTMap: 添加矩形失败: " + ((e as Error).message ?? String(e)))
         overlayMap.delete(id)
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 4, message: "添加矩形失败: " + (e.message ?? String(e)) })
+            onErrorCallback({ code: 4, message: "添加矩形失败: " + ((e as Error).message ?? String(e)) })
         }
     })
     return id
@@ -792,19 +868,21 @@ export function addLabel(lat: number, lng: number, text: string): number {
         // 预分配 ID（同步），异步完成后更新 nativeRef
         overlayIdCounter++
         const id = overlayIdCounter
-        overlayMap.set(id, { id: id, type: 'label', nativeRef: null, isVisible: true })
+        const entry: OverlayEntry = { id: id, type: 'label', nativeRef: null, isVisible: true }
+        overlayMap.set(id, entry)
         // context7 验证：addMarker 可能 reject，统一错误处理
-        mapController.addMarker({
+        const markerOpts: mapCommon.MarkerOptions = {
             position: { latitude: lat, longitude: lng },
             title: text
-        }).then((marker: any) => {
+        }
+        mapController.addMarker(markerOpts).then((marker: map.Marker) => {
             markerList.push(marker)
             const entry = overlayMap.get(id)
             if (entry != null) {
                 entry.nativeRef = marker
             }
-        }).catch((e: any) => {
-            console.error("TDTMap: addLabel 失败: " + (e.message ?? String(e)))
+        }).catch((e: Error) => {
+            console.error("TDTMap: addLabel 失败: " + ((e as Error).message ?? String(e)))
             overlayMap.delete(id)
         })
         return id
@@ -831,19 +909,21 @@ export function setMarkers(markers: Array<MapClickDetail>): Array<number> {
         const pt = markers[i]
         overlayIdCounter++
         const id = overlayIdCounter
-        overlayMap.set(id, { id: id, type: 'marker', nativeRef: null, isVisible: true })
+        const entry: OverlayEntry = { id: id, type: 'marker', nativeRef: null, isVisible: true }
+        overlayMap.set(id, entry)
         ids.push(id)
         const markerIndex = i  // 捕获循环变量供异步回调使用
-        mapController.addMarker({
+        const markerOpts: mapCommon.MarkerOptions = {
             position: { latitude: pt.lat, longitude: pt.lng }
-        }).then((mk: any) => {
+        }
+        mapController.addMarker(markerOpts).then((mk: map.Marker) => {
             markerList.push(mk)
             const entry = overlayMap.get(id)
             if (entry != null) {
                 entry.nativeRef = mk
             }
-        }).catch((e: any) => {
-            console.error("TDTMap: setMarkers[" + markerIndex + "] 失败: " + (e.message ?? String(e)))
+        }).catch((e: Error) => {
+            console.error("TDTMap: setMarkers[" + markerIndex + "] 失败: " + ((e as Error).message ?? String(e)))
             overlayMap.delete(id)
         })
     }
@@ -894,7 +974,7 @@ export function clearOverlays(): void {
     // v1.9.0: clear() 已连带清除图片覆盖物，同步清理状态与 PixelMap
     clearImageOverlayStateInternal()
     // 瓦片重建 fire-and-forget（不阻塞返回，接口签名 void 要求同步返回）
-    createTileLayerPair(currentMapType, currentApiKey).then((pair: { base: map.TileOverlay | null, label: map.TileOverlay | null }) => {
+    createTileLayerPair(currentMapType, currentApiKey).then((pair: TileOverlayPair) => {
         tileOverlay = pair.base
         labelOverlay = pair.label
         const idx = getTypeIndex(currentMapType)
@@ -905,8 +985,8 @@ export function clearOverlays(): void {
                 allTileOverlays[i] = { base: null, label: null }
             }
         }
-    }).catch((e: any) => {
-        console.error("TDTMap: clearOverlays 瓦片重建失败: " + (e.message ?? String(e)))
+    }).catch((e: Error) => {
+        console.error("TDTMap: clearOverlays 瓦片重建失败: " + ((e as Error).message ?? String(e)))
     })
 }
 
@@ -965,11 +1045,11 @@ export function destroyMap(): void {
         const oid = imageOverlayIds[i]
         const entryImg = overlayMap.get(oid)
         if (entryImg != null && entryImg.nativeRef != null) {
-            try { entryImg.nativeRef.remove() } catch (e: any) { /* 容忍 */ }
+            try { entryImg.nativeRef.remove() } catch (e) { /* 容忍 */ }
         }
         const extImg = imageOverlayExt.get(oid)
         if (extImg != null && extImg.pixelMap != null) {
-            try { (extImg.pixelMap as image.PixelMap).release() } catch (e2: any) { /* 容忍 */ }
+            try { (extImg.pixelMap as image.PixelMap).release() } catch (e2) { /* 容忍 */ }
         }
         imageOverlayExt.delete(oid)
     }
@@ -1006,12 +1086,13 @@ export function zoomIn(): void {
     if (mapController != null) {
         currentZoom = currentZoom + 1
         // context7 验证：完整 CameraPosition 包含 target
-        mapController.setCameraPosition({
+        const cameraPos: mapCommon.CameraPosition = {
             target: { latitude: currentLat, longitude: currentLng },
             zoom: currentZoom,
             bearing: currentBearing,
             tilt: currentTilt
-        })
+        }
+        mapController.moveCamera(map.newCameraPosition(cameraPos))
     }
 }
 
@@ -1019,12 +1100,13 @@ export function zoomOut(): void {
     if (mapController != null) {
         currentZoom = currentZoom - 1
         // context7 验证：完整 CameraPosition 包含 target
-        mapController.setCameraPosition({
+        const cameraPos: mapCommon.CameraPosition = {
             target: { latitude: currentLat, longitude: currentLng },
             zoom: currentZoom,
             bearing: currentBearing,
             tilt: currentTilt
-        })
+        }
+        mapController.moveCamera(map.newCameraPosition(cameraPos))
     }
 }
 
@@ -1056,7 +1138,7 @@ export function panTo(lat: number, lng: number, zoom?: number): void {
     if (zoom != null) {
         currentZoom = zoom
     }
-    mapController.setCameraPosition(pos)
+    mapController.moveCamera(map.newCameraPosition(pos))
 }
 
 export function centerAndZoom(lat: number, lng: number, zoom: number): void {
@@ -1064,12 +1146,13 @@ export function centerAndZoom(lat: number, lng: number, zoom: number): void {
     currentLat = lat
     currentLng = lng
     currentZoom = zoom
-    mapController.setCameraPosition({
+    const cameraPos: mapCommon.CameraPosition = {
         target: { latitude: lat, longitude: lng },
         zoom: zoom,
         bearing: currentBearing,
         tilt: currentTilt
-    })
+    }
+    mapController.moveCamera(map.newCameraPosition(cameraPos))
 }
 
 // ==================== 手势控制 ====================
@@ -1192,16 +1275,30 @@ export function removeOverlay(id: number): void {
         // v1.9.0: 图片加载中即被移除——清理扩展状态，加载回调将因 entry 缺失而丢弃
         const ext0 = imageOverlayExt.get(id)
         if (ext0 != null && ext0.pixelMap != null) {
-            try { (ext0.pixelMap as image.PixelMap).release() } catch (e4: any) { /* 容忍 */ }
+            try { (ext0.pixelMap as image.PixelMap).release() } catch (e4) { /* 容忍 */ }
         }
         imageOverlayExt.delete(id)
         imageOverlayIds = imageOverlayIds.filter(x => x != id)
         return
     }
+    // v1.9.2: 批量 styled 折线——nativeRef 为线数组，逐条 remove 后过滤全局 polylines
+    if (entry.type == 'styledPolylineBatch') {
+        const refs = ref as Array<map.MapPolyline>
+        try {
+            for (let i = 0; i < refs.length; i++) {
+                refs[i].remove()
+            }
+        } catch (e) {
+            console.error("TDTMap: removeOverlay 失败: " + ((e as Error).message ?? String(e)))
+        }
+        polylines = polylines.filter(p => refs.indexOf(p) < 0)
+        overlayMap.delete(id)
+        return
+    }
     try {
         ref.remove()
-    } catch (e: any) {
-        console.error("TDTMap: removeOverlay 失败: " + (e.message ?? String(e)))
+    } catch (e) {
+        console.error("TDTMap: removeOverlay 失败: " + ((e as Error).message ?? String(e)))
     }
     // 同步清理类型数组
     if (entry.type == 'marker' || entry.type == 'label') {
@@ -1222,7 +1319,7 @@ export function removeOverlay(id: number): void {
         const ext = imageOverlayExt.get(id)
         if (ext != null) {
             if (ext.pixelMap != null) {
-                try { (ext.pixelMap as image.PixelMap).release() } catch (e5: any) { /* 容忍 */ }
+                try { (ext.pixelMap as image.PixelMap).release() } catch (e5) { /* 容忍 */ }
             }
             imageOverlayExt.delete(id)
         }
@@ -1237,11 +1334,24 @@ export function showOverlay(id: number): void {
     if (entry == null) return
     const ref = entry.nativeRef
     if (ref == null || entry.isVisible) return
+    // v1.9.2: 批量 styled 折线——nativeRef 为线数组，逐线 setVisible
+    if (entry.type == 'styledPolylineBatch') {
+        const refs = ref as Array<map.MapPolyline>
+        try {
+            for (let i = 0; i < refs.length; i++) {
+                refs[i].setVisible(true)
+            }
+            entry.isVisible = true
+        } catch (e) {
+            console.error("TDTMap: showOverlay 失败: " + ((e as Error).message ?? String(e)))
+        }
+        return
+    }
     try {
         ref.setVisible(true)
         entry.isVisible = true
-    } catch (e: any) {
-        console.error("TDTMap: showOverlay 失败: " + (e.message ?? String(e)))
+    } catch (e) {
+        console.error("TDTMap: showOverlay 失败: " + ((e as Error).message ?? String(e)))
     }
 }
 
@@ -1250,11 +1360,24 @@ export function hideOverlay(id: number): void {
     if (entry == null) return
     const ref = entry.nativeRef
     if (ref == null || !entry.isVisible) return
+    // v1.9.2: 批量 styled 折线——nativeRef 为线数组，逐线 setVisible
+    if (entry.type == 'styledPolylineBatch') {
+        const refs = ref as Array<map.MapPolyline>
+        try {
+            for (let i = 0; i < refs.length; i++) {
+                refs[i].setVisible(false)
+            }
+            entry.isVisible = false
+        } catch (e) {
+            console.error("TDTMap: hideOverlay 失败: " + ((e as Error).message ?? String(e)))
+        }
+        return
+    }
     try {
         ref.setVisible(false)
         entry.isVisible = false
-    } catch (e: any) {
-        console.error("TDTMap: hideOverlay 失败: " + (e.message ?? String(e)))
+    } catch (e) {
+        console.error("TDTMap: hideOverlay 失败: " + ((e as Error).message ?? String(e)))
     }
 }
 
@@ -1281,10 +1404,10 @@ export function checkResize(): void {
     // HarmonyOS MapKit 自动响应布局变化，无需手动触发
 }
 
-// context7 验证：HarmonyOS MapKit 支持 scrollBy 像素级平移
+// context7 验证：HarmonyOS MapKit scrollBy 是 CameraUpdate 工厂（非 controller 方法），配合 moveCamera 实现像素级平移
 export function planBy(x: number, y: number): void {
     if (mapController != null) {
-        mapController.scrollBy(x, y)
+        mapController.moveCamera(map.scrollBy(x, y))
     }
 }
 
@@ -1310,10 +1433,11 @@ export function setViewport(points: Array<MapClickDetail>): void {
     currentLat = centerLat
     currentLng = centerLng
     currentZoom = zoom
-    mapController.setCameraPosition({
+    const fitPos2: mapCommon.CameraPosition = {
         target: { latitude: centerLat, longitude: centerLng },
         zoom: zoom
-    })
+    }
+    mapController.moveCamera(map.newCameraPosition(fitPos2))
 }
 
 // context7 验证：HarmonyOS 容器尺寸需从 UniNativeViewElement 获取，此处返回 0
@@ -1378,11 +1502,12 @@ const TDT_API_BASE = 'https://api.tianditu.gov.cn'
 
 function tiandituHttpRequest(urlStr: string, callback: GeocodeCallback): void {
     const httpRequest = http.createHttp()
-    httpRequest.request(urlStr, {
+    const reqOpts: http.HttpRequestOptions = {
         method: http.RequestMethod.GET,
         connectTimeout: 10000,
         readTimeout: 10000
-    }, (err: any, data: any) => {
+    }
+    httpRequest.request(urlStr, reqOpts, (err: BusinessError, data: http.HttpResponse) => {
         if (err != null) {
             console.error("TDTMap: HTTP 请求失败: " + (err.message ?? String(err)))
             callback({ status: '404', msg: err.message ?? 'Network error' } as UTSJSONObject)
@@ -1396,8 +1521,8 @@ function tiandituHttpRequest(urlStr: string, callback: GeocodeCallback): void {
                     return
                 }
                 callback(parsed as UTSJSONObject)
-            } catch (e: any) {
-                callback({ status: '404', msg: e.message ?? 'Parse error' } as UTSJSONObject)
+            } catch (e) {
+                callback({ status: '404', msg: (e as Error).message ?? 'Parse error' } as UTSJSONObject)
             }
         }
         httpRequest.destroy()
@@ -1505,10 +1630,10 @@ export function showUserLocation(enabled: boolean): void {
     }
     try {
         mapController.setMyLocationEnabled(enabled)
-    } catch (e: any) {
-        console.error("TDTMap: showUserLocation 失败: " + (e.message ?? String(e)))
+    } catch (e) {
+        console.error("TDTMap: showUserLocation 失败: " + ((e as Error).message ?? String(e)))
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 4, message: "定位显示失败: " + (e.message ?? String(e)) })
+            onErrorCallback({ code: 4, message: "定位显示失败: " + ((e as Error).message ?? String(e)) })
         }
     }
 }
@@ -1517,7 +1642,7 @@ export function showUserLocation(enabled: boolean): void {
 @UTSJS.keepAlive
 export function getUserLocation(callback: (detail: MapClickDetail) => void, onError?: (err: MapErrorDetail) => void): void {
     try {
-        geoLocationManager.getCurrentLocation((err: any, location: any) => {
+        geoLocationManager.getCurrentLocation((err: BusinessError, location: geoLocationManager.Location) => {
             if (err != null) {
                 console.error("TDTMap: getUserLocation 失败: " + (err.message ?? String(err)))
                 if (onError != null) {
@@ -1535,10 +1660,10 @@ export function getUserLocation(callback: (detail: MapClickDetail) => void, onEr
                 }
             }
         })
-    } catch (e: any) {
-        console.error("TDTMap: getUserLocation 异常: " + (e.message ?? String(e)))
+    } catch (e) {
+        console.error("TDTMap: getUserLocation 异常: " + ((e as Error).message ?? String(e)))
         if (onError != null) {
-            onError({ code: 4, message: "获取定位异常: " + (e.message ?? String(e)) })
+            onError({ code: 4, message: "获取定位异常: " + ((e as Error).message ?? String(e)) })
         }
     }
 }
@@ -1552,15 +1677,16 @@ export function showMarkerInfo(id: number): void {
     const entry = overlayMap.get(id)
     if (entry == null) return
     if (entry.type == 'marker' || entry.type == 'label') {
-        const mk = entry.nativeRef
+        const mk = entry.nativeRef as map.Marker
         if (mk == null) {
             console.warn("TDTMap: showMarkerInfo - marker 尚未异步创建完成 (nativeRef=null)")
             return
         }
         try {
-            mk.showInfoWindow()
-        } catch (e: any) {
-            console.error("TDTMap: showMarkerInfo 失败: " + (e.message ?? String(e)))
+            // 华为 MapKit Marker 无 showInfoWindow/hideInfoWindow，等价 API 为 setInfoWindowVisible
+            mk.setInfoWindowVisible(true)
+        } catch (e) {
+            console.error("TDTMap: showMarkerInfo 失败: " + ((e as Error).message ?? String(e)))
         }
     }
 }
@@ -1569,12 +1695,12 @@ export function hideMarkerInfo(id: number): void {
     const entry = overlayMap.get(id)
     if (entry == null) return
     if (entry.type == 'marker' || entry.type == 'label') {
-        const mk = entry.nativeRef
+        const mk = entry.nativeRef as map.Marker
         if (mk == null) return
         try {
-            mk.hideInfoWindow()
-        } catch (e: any) {
-            console.error("TDTMap: hideMarkerInfo 失败: " + (e.message ?? String(e)))
+            mk.setInfoWindowVisible(false)
+        } catch (e) {
+            console.error("TDTMap: hideMarkerInfo 失败: " + ((e as Error).message ?? String(e)))
         }
     }
 }
@@ -1613,10 +1739,10 @@ export function addCustomTileLayer(id: string, tileUrl: string, options?: TileLa
         if (options != null && (options.minZoom != null || options.maxZoom != null)) {
             console.warn("TDTMap: 鸿蒙 TileOverlay 不支持 minZoom/maxZoom，已忽略")
         }
-    } catch (e: any) {
-        console.error("TDTMap: addCustomTileLayer 异常: " + (e.message ?? String(e)))
+    } catch (e) {
+        console.error("TDTMap: addCustomTileLayer 异常: " + ((e as Error).message ?? String(e)))
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 4, message: "添加瓦片图层失败: " + (e.message ?? String(e)) })
+            onErrorCallback({ code: 4, message: "添加瓦片图层失败: " + ((e as Error).message ?? String(e)) })
         }
     }
 }
@@ -1626,8 +1752,8 @@ export function removeCustomTileLayer(id: string): void {
     if (overlay == null) return
     try {
         overlay.remove()
-    } catch (e: any) {
-        console.error("TDTMap: removeCustomTileLayer 失败: " + (e.message ?? String(e)))
+    } catch (e) {
+        console.error("TDTMap: removeCustomTileLayer 失败: " + ((e as Error).message ?? String(e)))
     }
     customTileOverlays.delete(id)
 }
@@ -1676,24 +1802,26 @@ export function setMapLongClickCallback(callback: MapLongClickCallback): void {
 export function setBearing(bearing: number): void {
     if (mapController == null) return
     currentBearing = bearing
-    mapController.setCameraPosition({
+    const cameraPos: mapCommon.CameraPosition = {
         target: { latitude: currentLat, longitude: currentLng },
         zoom: currentZoom,
         bearing: bearing,
         tilt: currentTilt
-    })
+    }
+    mapController.moveCamera(map.newCameraPosition(cameraPos))
 }
 
 // context7 验证：HarmonyOS CameraPosition.tilt 设置倾斜角度（0=垂直俯瞰，范围 0~75）
 export function setTilt(tilt: number): void {
     if (mapController == null) return
     currentTilt = tilt
-    mapController.setCameraPosition({
+    const cameraPos: mapCommon.CameraPosition = {
         target: { latitude: currentLat, longitude: currentLng },
         zoom: currentZoom,
         bearing: currentBearing,
         tilt: tilt
-    })
+    }
+    mapController.moveCamera(map.newCameraPosition(cameraPos))
 }
 
 // context7 验证：getCameraPosition().bearing 读取当前旋转角度
@@ -1741,8 +1869,17 @@ export function setCameraChangeCallback(callback: CameraChangeCallback): void {
 // 返回 Promise<ClusterOverlay>；官方聚合自带"点击放大"（点击聚合簇自动放大展开，无需自实现）
 // distance 单位 vp（官方示例 100），ClusterItem = { position: { latitude, longitude } }
 // ══════════════════════════════════════════════
-let clusterOverlayRef: any = null
-let heatmapRef: any = null
+let clusterOverlayRef: map.ClusterOverlay | null = null
+let heatmapRef: map.Heatmap | null = null
+
+// 华为 MapKit ClusterItem 为 abstract class，定义插件内子类用于实例化聚合点
+class TDTClusterItem extends mapCommon.ClusterItem {
+    constructor(lat: number, lng: number) {
+        super()
+        const pos: mapCommon.LatLng = { latitude: lat, longitude: lng }
+        this.position = pos
+    }
+}
 
 export function addMarkerCluster(points: Array<MapClickDetail>, options?: ClusterOptions): void {
     const ctrl = mapController
@@ -1752,27 +1889,29 @@ export function addMarkerCluster(points: Array<MapClickDetail>, options?: Cluste
     }
     removeMarkerCluster()
     if (points.length == 0) return
+    // 华为 ClusterItem 为 abstract class，须以子类实例构造（字面量会被包装为 UTSJSONObject 拒收）
     const items: Array<mapCommon.ClusterItem> = []
     for (let i = 0; i < points.length; i++) {
-        items.push({ position: { latitude: points[i].lat, longitude: points[i].lng } })
+        const item: TDTClusterItem = new TDTClusterItem(points[i].lat, points[i].lng)
+        items.push(item)
     }
     const params: mapCommon.ClusterOverlayParams = {
         distance: 100,
         clusterItems: items
     }
-    ctrl.addClusterOverlay(params).then((overlay: any) => {
+    ctrl.addClusterOverlay(params).then((overlay: map.ClusterOverlay) => {
         clusterOverlayRef = overlay
-    }).catch((e: any) => {
-        console.error("TDTMap: 添加聚合图层失败: " + (e.message ?? String(e)))
+    }).catch((e: Error) => {
+        console.error("TDTMap: 添加聚合图层失败: " + ((e as Error).message ?? String(e)))
         if (onErrorCallback != null) {
-            onErrorCallback({ code: 4, message: "添加聚合图层失败: " + (e.message ?? String(e)) })
+            onErrorCallback({ code: 4, message: "添加聚合图层失败: " + ((e as Error).message ?? String(e)) })
         }
     })
 }
 
 export function removeMarkerCluster(): void {
     if (clusterOverlayRef != null) {
-        try { clusterOverlayRef.remove() } catch (e: any) { /* ignore */ }
+        try { clusterOverlayRef.remove() } catch (e) { /* ignore */ }
     }
     clusterOverlayRef = null
 }
@@ -1792,10 +1931,11 @@ export function addHeatmap(points: Array<HeatmapItem>, options?: HeatmapOptions)
     if (points.length == 0) return
     const data: Array<mapCommon.WeightedLatLng> = []
     for (let i = 0; i < points.length; i++) {
-        data.push({
+        const wll: mapCommon.WeightedLatLng = {
             point: { latitude: points[i].lat, longitude: points[i].lng },
             intensity: points[i].weight ?? 1
-        })
+        }
+        data.push(wll)
     }
     const params: mapCommon.HeatmapParams = {
         id: 'tdt-heatmap',
@@ -1804,17 +1944,17 @@ export function addHeatmap(points: Array<HeatmapItem>, options?: HeatmapOptions)
         intensity: { 1: 1, 5: 5, 8: 10 }
     }
     try {
-        ctrl.addHeatmap(params).then((heatmap: any) => {
+        ctrl.addHeatmap(params).then((heatmap: map.Heatmap) => {
             heatmapRef = heatmap
-        }).catch((e: any) => {
-            console.error("TDTMap: 添加热力图失败: " + (e.message ?? String(e)))
+        }).catch((e: Error) => {
+            console.error("TDTMap: 添加热力图失败: " + ((e as Error).message ?? String(e)))
             if (onErrorCallback != null) {
-                onErrorCallback({ code: 4, message: "添加热力图失败: " + (e.message ?? String(e)) })
+                onErrorCallback({ code: 4, message: "添加热力图失败: " + ((e as Error).message ?? String(e)) })
             }
         })
-    } catch (e: any) {
+    } catch (e) {
         // 低版本 MapKit（< 6.0.0(20)）无 addHeatmap 方法：显式上报能力不支持
-        console.error("TDTMap: 当前 MapKit 版本不支持热力图（需 HarmonyOS 6.0+）: " + (e.message ?? String(e)))
+        console.error("TDTMap: 当前 MapKit 版本不支持热力图（需 HarmonyOS 6.0+）: " + ((e as Error).message ?? String(e)))
         if (onErrorCallback != null) {
             onErrorCallback({ code: 4, message: "当前 MapKit 版本不支持热力图（需 HarmonyOS 6.0 / API 20+）" })
         }
@@ -1823,7 +1963,7 @@ export function addHeatmap(points: Array<HeatmapItem>, options?: HeatmapOptions)
 
 export function removeHeatmap(): void {
     if (heatmapRef != null) {
-        try { heatmapRef.remove() } catch (e: any) { /* ignore */ }
+        try { heatmapRef.remove() } catch (e) { /* ignore */ }
     }
     heatmapRef = null
 }
@@ -1838,7 +1978,7 @@ function clearImageOverlayStateInternal(): void {
     for (let i = 0; i < imageOverlayIds.length; i++) {
         const ext = imageOverlayExt.get(imageOverlayIds[i])
         if (ext != null && ext.pixelMap != null) {
-            try { (ext.pixelMap as image.PixelMap).release() } catch (e: any) { /* 容忍 */ }
+            try { (ext.pixelMap as image.PixelMap).release() } catch (e) { /* 容忍 */ }
         }
         imageOverlayExt.delete(imageOverlayIds[i])
     }
@@ -1850,7 +1990,7 @@ function clearImageOverlayStateInternal(): void {
 function reportImageOverlayFailure(id: number, code: number, message: string): void {
     const ext = imageOverlayExt.get(id)
     if (ext != null && ext.pixelMap != null) {
-        try { (ext.pixelMap as image.PixelMap).release() } catch (e: any) { /* 容忍 */ }
+        try { (ext.pixelMap as image.PixelMap).release() } catch (e) { /* 容忍 */ }
     }
     imageOverlayExt.delete(id)
     imageOverlayIds = imageOverlayIds.filter(x => x != id)
@@ -1866,13 +2006,14 @@ function loadPixelMapForOverlay(id: number, imageSrc: string): void {
     const isHttp = imageSrc.indexOf('http://') == 0 || imageSrc.indexOf('https://') == 0
     if (isHttp) {
         const httpRequest = http.createHttp()
-        httpRequest.request(imageSrc, {
+        const reqOpts: http.HttpRequestOptions = {
             method: http.RequestMethod.GET,
             connectTimeout: 15000,
             readTimeout: 15000,
             // 华为官方 FAQ：image 参数仅支持 ResourceStr/PixelMap，网络图必须下载转 PixelMap
             expectDataType: http.HttpDataType.ARRAY_BUFFER
-        }, (err: any, data: any) => {
+        }
+        httpRequest.request(imageSrc, reqOpts, (err: BusinessError, data: http.HttpResponse) => {
             httpRequest.destroy()
             if (overlayMap.get(id) == null) return  // 加载期间被移除/清空
             if (err != null) {
@@ -1883,16 +2024,16 @@ function loadPixelMapForOverlay(id: number, imageSrc: string): void {
                 const buf = data.result as ArrayBuffer
                 const imgSource = image.createImageSource(buf)
                 createOverlayPixelMap(id, imgSource)
-            } catch (e: any) {
-                reportImageOverlayFailure(id, 4, "图片解码失败: " + (e.message ?? String(e)))
+            } catch (e) {
+                reportImageOverlayFailure(id, 4, "图片解码失败: " + ((e as Error).message ?? String(e)))
             }
         })
     } else {
         try {
             const imgSource = image.createImageSource(imageSrc)
             createOverlayPixelMap(id, imgSource)
-        } catch (e: any) {
-            reportImageOverlayFailure(id, 4, "图片加载失败（路径不存在或非图片）: " + (e.message ?? String(e)))
+        } catch (e) {
+            reportImageOverlayFailure(id, 4, "图片加载失败（路径不存在或非图片）: " + ((e as Error).message ?? String(e)))
         }
     }
 }
@@ -1900,8 +2041,8 @@ function loadPixelMapForOverlay(id: number, imageSrc: string): void {
 // 由 ImageSource 创建 PixelMap（最长边>4096 时 desiredSize 等比下采样防 OOM）并挂载原生 ImageOverlay
 function createOverlayPixelMap(id: number, imgSource: any): void {
     const src = imgSource as image.ImageSource
-    src.getImageInfo().then((info: any) => {
-        let opts: any = {}
+    src.getImageInfo().then((info: image.ImageInfo) => {
+        let opts: image.DecodingOptions = {}
         const w = info.size.width as number
         const h = info.size.height as number
         const maxDim = Math.max(w, h)
@@ -1910,11 +2051,11 @@ function createOverlayPixelMap(id: number, imgSource: any): void {
             opts = { desiredSize: { width: Math.floor(w * scale), height: Math.floor(h * scale) } }
         }
         return src.createPixelMap(opts)
-    }).then((pixelMap: any) => {
-        try { src.release() } catch (e: any) { /* 容忍 */ }
+    }).then((pixelMap: image.PixelMap) => {
+        try { src.release() } catch (e) { /* 容忍 */ }
         if (overlayMap.get(id) == null) {
             // 加载期间被移除：丢弃结果
-            try { (pixelMap as image.PixelMap).release() } catch (e2: any) { /* 容忍 */ }
+            try { (pixelMap as image.PixelMap).release() } catch (e2) { /* 容忍 */ }
             return
         }
         const ext = imageOverlayExt.get(id)
@@ -1922,25 +2063,26 @@ function createOverlayPixelMap(id: number, imgSource: any): void {
             ext.pixelMap = pixelMap
         }
         applyImageOverlayNative(id, pixelMap)
-    }).catch((e: any) => {
-        try { src.release() } catch (e3: any) { /* 容忍 */ }
-        reportImageOverlayFailure(id, 4, "图片解码失败: " + (e.message ?? String(e)))
+    }).catch((e: Error) => {
+        try { src.release() } catch (e3) { /* 容忍 */ }
+        reportImageOverlayFailure(id, 4, "图片解码失败: " + ((e as Error).message ?? String(e)))
     })
 }
 
 // 组装 ImageOverlayParams（华为 schema：bounds/image/transparency/zIndex/anchorU/anchorV/clickable/visible/bearing）
 // 并调用原生 addImageOverlay；完成后回填 nativeRef + 反查表，并应用加载期间的 pendingUpdate
 // ⚠️ 真机验证项：ImageOverlayParams 字段名以华为官方文档为准；对象字面量直传（addPolygon 同款先例）
-function applyImageOverlayNative(id: number, pixelMap: any): void {
+function applyImageOverlayNative(id: number, pixelMap: image.PixelMap): void {
     const ctrl = mapController
     const ext = imageOverlayExt.get(id)
     if (ctrl == null || ext == null) return
     const p = ext.params
-    ctrl.addImageOverlay({
-        bounds: {
-            southwest: { latitude: p.southwest.lat, longitude: p.southwest.lng },
-            northeast: { latitude: p.northeast.lat, longitude: p.northeast.lng }
-        },
+    const imgBounds: mapCommon.LatLngBounds = {
+        southwest: { latitude: p.southwest.lat, longitude: p.southwest.lng },
+        northeast: { latitude: p.northeast.lat, longitude: p.northeast.lng }
+    }
+    const imgParams: mapCommon.ImageOverlayParams = {
+        bounds: imgBounds,
         image: pixelMap,
         transparency: p.transparency ?? 0,
         zIndex: p.zIndex ?? 0,
@@ -1949,12 +2091,13 @@ function applyImageOverlayNative(id: number, pixelMap: any): void {
         clickable: p.clickable ?? true,
         visible: p.visible ?? true,
         bearing: p.bearing ?? 0
-    }).then((overlay: any) => {
+    }
+    ctrl.addImageOverlay(imgParams).then((overlay: map.ImageOverlay) => {
         const entry = overlayMap.get(id)
         if (entry == null) {
             // 挂载完成前已被移除：清理原生对象与 PixelMap
-            try { overlay.remove() } catch (e: any) { /* 容忍 */ }
-            try { (pixelMap as image.PixelMap).release() } catch (e2: any) { /* 容忍 */ }
+            try { overlay.remove() } catch (e) { /* 容忍 */ }
+            try { (pixelMap as image.PixelMap).release() } catch (e2) { /* 容忍 */ }
             return
         }
         entry.nativeRef = overlay
@@ -1965,9 +2108,9 @@ function applyImageOverlayNative(id: number, pixelMap: any): void {
         if (pending != null) {
             updateImageOverlay(id, pending)
         }
-    }).catch((e: any) => {
-        console.error("TDTMap: addImageOverlay 失败: " + (e.message ?? String(e)))
-        reportImageOverlayFailure(id, 4, "添加图片覆盖物失败: " + (e.message ?? String(e)))
+    }).catch((e: Error) => {
+        console.error("TDTMap: addImageOverlay 失败: " + ((e as Error).message ?? String(e)))
+        reportImageOverlayFailure(id, 4, "添加图片覆盖物失败: " + ((e as Error).message ?? String(e)))
     })
 }
 
@@ -1976,7 +2119,8 @@ export function addImageOverlay(params: ImageOverlayOptions): number {
     if (mapController == null) return 0
     overlayIdCounter++
     const id = overlayIdCounter
-    overlayMap.set(id, { id: id, type: 'image', nativeRef: null, isVisible: params.visible ?? true })
+    const entry: OverlayEntry = { id: id, type: 'image', nativeRef: null, isVisible: params.visible ?? true }
+    overlayMap.set(id, entry)
     imageOverlayExt.set(id, { params: params, pixelMap: null, pendingUpdate: null })
     imageOverlayIds.push(id)
     loadPixelMapForOverlay(id, params.image)
@@ -1990,11 +2134,10 @@ export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOption
     // 图片仍在加载：全部累积进 pendingUpdate，挂载完成后统一重放（换图项会经正常换图路径重新加载，
     // 语义与 Android/Web/iOS "加载中合并"一致——最终状态正确，代价是新图多一次加载）
     if (entry.nativeRef == null) {
-        let merged: any
+        // 以 changes 为基准合并（等价于原"空对象起步逐项覆盖"语义，且规避空字面量断言）
+        let merged: ImageOverlayUpdateOptions = changes
         if (ext.pendingUpdate != null) {
             merged = ext.pendingUpdate
-        } else {
-            merged = {}
         }
         if (changes.southwest != null) merged.southwest = changes.southwest
         if (changes.northeast != null) merged.northeast = changes.northeast
@@ -2008,7 +2151,7 @@ export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOption
         return
     }
     const p = ext.params
-    const ref = entry.nativeRef
+    const ref = entry.nativeRef as map.ImageOverlay
     // 合并变更（未传字段保持不变）
     if (changes.southwest != null) p.southwest = changes.southwest
     if (changes.northeast != null) p.northeast = changes.northeast
@@ -2020,11 +2163,11 @@ export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOption
     if (changes.clickable != null) p.clickable = changes.clickable
     // 换图：需重新走加载管线（新地址可能是网络图），完成后重新挂载（同 ID）
     if (changes.image != null) {
-        try { ref.remove() } catch (e: any) { /* 容忍 */ }
+        try { ref.remove() } catch (e) { /* 容忍 */ }
         imageOverlayNativeIdMap.delete(String(ref.getId()))
         entry.nativeRef = null
         if (ext.pixelMap != null) {
-            try { (ext.pixelMap as image.PixelMap).release() } catch (e2: any) { /* 容忍 */ }
+            try { (ext.pixelMap as image.PixelMap).release() } catch (e2) { /* 容忍 */ }
             ext.pixelMap = null
         }
         loadPixelMapForOverlay(id, p.image)
@@ -2046,19 +2189,20 @@ export function updateImageOverlay(id: number, changes: ImageOverlayUpdateOption
             ref.setBearing(p.bearing ?? 0)
         }
         if (changes.southwest != null || changes.northeast != null) {
-            ref.setBounds({
+            const newBounds: mapCommon.LatLngBounds = {
                 southwest: { latitude: p.southwest.lat, longitude: p.southwest.lng },
                 northeast: { latitude: p.northeast.lat, longitude: p.northeast.lng }
-            })
+            }
+            ref.setBounds(newBounds)
         }
         if (changes.clickable != null) {
             // ImageOverlay 无 clickable setter（params 型，仅重建生效）——文档说明的已知限制
             console.warn("TDTMap: 鸿蒙端 clickable 更新需重建覆盖物，当前版本暂不生效")
         }
-    } catch (e: any) {
+    } catch (e) {
         // setter 不可用回退：remove + 以已有 PixelMap 重挂（保 ID，不重新下载）
-        console.warn("TDTMap: ImageOverlay setter 不可用，回退 remove+重挂载: " + (e.message ?? String(e)))
-        try { ref.remove() } catch (e3: any) { /* 容忍 */ }
+        console.warn("TDTMap: ImageOverlay setter 不可用，回退 remove+重挂载: " + ((e as Error).message ?? String(e)))
+        try { ref.remove() } catch (e3) { /* 容忍 */ }
         imageOverlayNativeIdMap.delete(String(ref.getId()))
         entry.nativeRef = null
         if (ext.pixelMap != null) {
