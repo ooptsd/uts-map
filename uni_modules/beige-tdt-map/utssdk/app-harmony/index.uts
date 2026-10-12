@@ -49,6 +49,9 @@ let markerList: Array<map.Marker> = []
 // 为每个添加的覆盖物分配唯一 ID，支持 removeOverlay/showOverlay/hideOverlay 单个操作
 let overlayIdCounter: number = 0
 let overlayMap = new Map<number, OverlayEntry>()
+// v1.9.2: 批量 styled 折线的线数组仓库——ArkTS 禁 any 且 OverlayEntry.nativeRef 仅容纳单对象（BaseOverlay），
+// 批量折线采用「entry.nativeRef 恒 null + 独立 Map 存线数组」实现（remove/show/hide 分支前置处理）
+let styledPolylineBatches = new Map<number, Array<map.MapPolyline>>()
 
 type OverlayEntry = {
     id: number
@@ -718,13 +721,16 @@ export function addStyledPolylineBatch(points: Array<MapClickDetail>, ringLength
     overlayIdCounter++
     const id = overlayIdCounter
     const refs: Array<map.MapPolyline> = []
-    const entry: OverlayEntry = { id: id, type: 'styledPolylineBatch', nativeRef: refs as any | null, isVisible: true }
+    // ArkTS 禁 any：批量线数组入独立仓库，entry.nativeRef 保持 null（读取侧分支前置）
+    styledPolylineBatches.set(id, refs)
+    const entry: OverlayEntry = { id: id, type: 'styledPolylineBatch', nativeRef: null, isVisible: true }
     overlayMap.set(id, entry)
     const colorNum = applyOpacityToColor(parseColorHex(color), opacity ?? 1)
     let added = 0
     let offset = 0
     for (let i = 0; i < ringLengths.length; i++) {
-        const len = ringLengths[i].toInt()
+        // ArkTS（JS number）无 toInt，取整用 Math.trunc
+        const len = Math.trunc(ringLengths[i])
         if (len < 2 || offset + len > points.length) {
             offset += len
             continue
@@ -752,6 +758,7 @@ export function addStyledPolylineBatch(points: Array<MapClickDetail>, ringLength
         offset += len
     }
     if (added == 0) {
+        styledPolylineBatches.delete(id)
         overlayMap.delete(id)
         return 0
     }
@@ -945,6 +952,7 @@ export function clearOverlays(): void {
         polylines = []
         circles = []
         rectangles = []
+        styledPolylineBatches.clear()
         return
     }
     // 逐个移除标记
@@ -971,6 +979,7 @@ export function clearOverlays(): void {
     polylines = []
     circles = []
     rectangles = []
+    styledPolylineBatches.clear()
     // v1.9.0: clear() 已连带清除图片覆盖物，同步清理状态与 PixelMap
     clearImageOverlayStateInternal()
     // 瓦片重建 fire-and-forget（不阻塞返回，接口签名 void 要求同步返回）
@@ -1031,6 +1040,7 @@ export function destroyMap(): void {
         polylines[i].remove()
     }
     polylines = []
+    styledPolylineBatches.clear()
     for (let i = 0; i < circles.length; i++) {
         circles[i].remove()
     }
@@ -1269,6 +1279,24 @@ export function removeOverlay(id: number): void {
         overlayMap.delete(id)
         return
     }
+    // v1.9.2: 批量 styled 折线——线数组存于 styledPolylineBatches（entry.nativeRef 恒 null），
+    // 分支置于 null 检查之前：逐条 remove 后过滤全局 polylines
+    if (entry.type == 'styledPolylineBatch') {
+        const refs = styledPolylineBatches.get(id)
+        if (refs != null) {
+            try {
+                for (let i = 0; i < refs.length; i++) {
+                    refs[i].remove()
+                }
+            } catch (e) {
+                console.error("TDTMap: removeOverlay 失败: " + ((e as Error).message ?? String(e)))
+            }
+            polylines = polylines.filter(p => refs.indexOf(p) < 0)
+        }
+        styledPolylineBatches.delete(id)
+        overlayMap.delete(id)
+        return
+    }
     const ref = entry.nativeRef
     if (ref == null) {
         overlayMap.delete(id)
@@ -1279,20 +1307,6 @@ export function removeOverlay(id: number): void {
         }
         imageOverlayExt.delete(id)
         imageOverlayIds = imageOverlayIds.filter(x => x != id)
-        return
-    }
-    // v1.9.2: 批量 styled 折线——nativeRef 为线数组，逐条 remove 后过滤全局 polylines
-    if (entry.type == 'styledPolylineBatch') {
-        const refs = ref as Array<map.MapPolyline>
-        try {
-            for (let i = 0; i < refs.length; i++) {
-                refs[i].remove()
-            }
-        } catch (e) {
-            console.error("TDTMap: removeOverlay 失败: " + ((e as Error).message ?? String(e)))
-        }
-        polylines = polylines.filter(p => refs.indexOf(p) < 0)
-        overlayMap.delete(id)
         return
     }
     try {
@@ -1332,21 +1346,24 @@ export function removeOverlay(id: number): void {
 export function showOverlay(id: number): void {
     const entry = overlayMap.get(id)
     if (entry == null) return
-    const ref = entry.nativeRef
-    if (ref == null || entry.isVisible) return
-    // v1.9.2: 批量 styled 折线——nativeRef 为线数组，逐线 setVisible
+    // v1.9.2: 批量 styled 折线——线数组存于 styledPolylineBatches（entry.nativeRef 恒 null），分支前置逐线 setVisible
     if (entry.type == 'styledPolylineBatch') {
-        const refs = ref as Array<map.MapPolyline>
-        try {
-            for (let i = 0; i < refs.length; i++) {
-                refs[i].setVisible(true)
+        if (entry.isVisible) return
+        const refs = styledPolylineBatches.get(id)
+        if (refs != null) {
+            try {
+                for (let i = 0; i < refs.length; i++) {
+                    refs[i].setVisible(true)
+                }
+                entry.isVisible = true
+            } catch (e) {
+                console.error("TDTMap: showOverlay 失败: " + ((e as Error).message ?? String(e)))
             }
-            entry.isVisible = true
-        } catch (e) {
-            console.error("TDTMap: showOverlay 失败: " + ((e as Error).message ?? String(e)))
         }
         return
     }
+    const ref = entry.nativeRef
+    if (ref == null || entry.isVisible) return
     try {
         ref.setVisible(true)
         entry.isVisible = true
@@ -1358,21 +1375,24 @@ export function showOverlay(id: number): void {
 export function hideOverlay(id: number): void {
     const entry = overlayMap.get(id)
     if (entry == null) return
-    const ref = entry.nativeRef
-    if (ref == null || !entry.isVisible) return
-    // v1.9.2: 批量 styled 折线——nativeRef 为线数组，逐线 setVisible
+    // v1.9.2: 批量 styled 折线——线数组存于 styledPolylineBatches（entry.nativeRef 恒 null），分支前置逐线 setVisible
     if (entry.type == 'styledPolylineBatch') {
-        const refs = ref as Array<map.MapPolyline>
-        try {
-            for (let i = 0; i < refs.length; i++) {
-                refs[i].setVisible(false)
+        if (entry.isVisible == false) return
+        const refs = styledPolylineBatches.get(id)
+        if (refs != null) {
+            try {
+                for (let i = 0; i < refs.length; i++) {
+                    refs[i].setVisible(false)
+                }
+                entry.isVisible = false
+            } catch (e) {
+                console.error("TDTMap: hideOverlay 失败: " + ((e as Error).message ?? String(e)))
             }
-            entry.isVisible = false
-        } catch (e) {
-            console.error("TDTMap: hideOverlay 失败: " + ((e as Error).message ?? String(e)))
         }
         return
     }
+    const ref = entry.nativeRef
+    if (ref == null || !entry.isVisible) return
     try {
         ref.setVisible(false)
         entry.isVisible = false
