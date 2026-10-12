@@ -82,7 +82,7 @@ function onMapClick(detail: MapClickDetail) {
 
 ## 🔖 当前版本
 
-**v1.9.0**（2026-09）：新增图片覆盖物（ImageOverlay，四端统一）。历史版本见 [changelog](tmp-publish/beige-tdt-map/changelog.md)。
+**v1.10.0**（2026-10）：Android 覆盖物迁移至 style layer 层系（清除弃用 annotations API）+ 鸿蒙 ArkTS 适配。历史版本见 [changelog](tmp-publish/beige-tdt-map/changelog.md)。
 
 ## 📄 开源协议
 

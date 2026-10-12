@@ -1,5 +1,18 @@
 # beige-tdt-map 更新日志
 
+## 1.10.0（2026-10-12）
+
+- 🔧 Android 重构：覆盖物迁移至 style layer 层系，清除弃用 annotations API——marker/setMarkers=SymbolLayer+Canvas 自绘位图、addLabel=文字转位图 icon-image、polygon/circle/rectangle=FillLayer+LineLayer 双层（alpha 原生展开，circle 保持 36 边近似）、addPolyline=LineLayer；styled 变体通路与对外契约（interface.uts）零改动，minSdk 21 不变
+- 🖱️ Android 点击命中改 queryRenderedFeatures 矩形容差（20px），payload {lat,lng} 契约不变；show/hide/remove/clear 走快照 hidden 意图位；setStyle 后六类覆盖物自动重放（保持原 ID）
+- ⚠️ Android showMarkerInfo/hideMarkerInfo 转 no-op——MapLibre 11.x native-view 下原生气泡不显示（组件层自绘气泡不受影响）；addLabel 文字由「不可见缺陷」转为常显
+- 🌐 鸿蒙 ArkTS 适配：批量 styled 折线线数组迁独立仓库 styledPolylineBatches（ArkTS 禁 any，OverlayEntry.nativeRef 仅容纳单对象）+ ringLengths 取整 toInt→Math.trunc
+- 📝 设计文档：docs/android-annotations-to-style-layers.md
+
+## 1.9.3（2026-10-09）
+
+- 🐛 Android 修复：unifile:// 本机路径图片解码归一化（normalizeUniFilePath 收敛解码唯一入口）——修复本机路径 addImageOverlay 必然 ENOENT、帧层全剔除空白
+- 🐛 Android 修复：showOverlay/hideOverlay 意图先行——ref 尚空时先记录 isVisible 意图、attach 时生效，修复「建层后立即 show」被静默丢弃致帧层永远不可见
+
 ## 1.9.2（2026-10-09）
 
 - ⚡ 性能：新增 `addStyledPolylineBatch`——批量 styled 折线一次调用建一个渲染层；`addGeoJsonLayer` 描边编排自动批量化（BeaconApp 雷达页 122 环两层建层 7.7s → 3.9s，描边部分毫秒级）
